@@ -12,7 +12,7 @@ public class MerchantStackerPlugin : BaseUnityPlugin
 {
     public const string PluginGuid = "io.github.raincloudthedragon.merchantstacker";
     public const string PluginName = "MerchantStacker";
-    public const string PluginVersion = "0.1.0";
+    public const string PluginVersion = "0.1.1";
 
     internal static MerchantStackerPlugin Instance { get; private set; } = null!;
     internal static ManualLogSource Log { get; private set; } = null!;
@@ -44,11 +44,24 @@ public class MerchantStackerPlugin : BaseUnityPlugin
         pickerGo.AddComponent<QuantityPicker>();
 
         _harmony = new Harmony(PluginGuid);
-        _harmony.PatchAll(typeof(ShopPurchasePatches));
-        _harmony.PatchAll(typeof(SimpleShopPatches));
-        _harmony.PatchAll(typeof(MachinePurchasePatches));
+        TryPatch(typeof(ShopPurchasePatches));
+        TryPatch(typeof(SimpleShopPatches));
+        TryPatch(typeof(MachinePurchasePatches));
 
         Log.LogInfo($"{PluginName} v{PluginVersion} loaded.");
+    }
+
+    private void TryPatch(System.Type type)
+    {
+        try
+        {
+            _harmony!.PatchAll(type);
+            Log.LogInfo($"Patched {type.Name}");
+        }
+        catch (System.Exception ex)
+        {
+            Log.LogError($"Failed to patch {type.Name}: {ex}");
+        }
     }
 
     private void OnDestroy()

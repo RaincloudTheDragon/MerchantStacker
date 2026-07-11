@@ -85,15 +85,21 @@ internal static class MachinePurchasePatches
         return false;
     }
 
+    // OnEnter is declared on CollectableItemAction, not CollectableItemCollect.
     [HarmonyPrefix]
-    [HarmonyPatch(typeof(CollectableItemCollect), nameof(CollectableItemCollect.OnEnter))]
-    private static bool CollectOnEnterPrefix(CollectableItemCollect __instance)
+    [HarmonyPatch(typeof(CollectableItemAction), nameof(CollectableItemAction.OnEnter))]
+    private static bool CollectOnEnterPrefix(CollectableItemAction __instance)
     {
+        if (__instance is not CollectableItemCollect collect)
+        {
+            return true;
+        }
+
         if (_skipNextCollect)
         {
             _skipNextCollect = false;
             _pendingCollectQty = 0;
-            __instance.Finish();
+            collect.Finish();
             return false;
         }
 
@@ -101,14 +107,14 @@ internal static class MachinePurchasePatches
         {
             int qty = _pendingCollectQty;
             _pendingCollectQty = 0;
-            var item = __instance.Item.Value as CollectableItem;
+            var item = collect.Item.Value as CollectableItem;
             if (item != null)
             {
                 item.Collect(qty);
                 MerchantStackerPlugin.Log.LogInfo($"Machine collected {qty}x {item.name}");
             }
 
-            __instance.Finish();
+            collect.Finish();
             return false;
         }
 
