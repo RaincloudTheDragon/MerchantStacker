@@ -492,3 +492,5 @@ $RECYCLE.BIN/
 .cursorindexingignore
 
 .specstory/
+
+.vscode/
