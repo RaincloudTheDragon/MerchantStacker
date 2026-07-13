@@ -7,21 +7,25 @@ using UnityEngine;
 namespace MerchantStacker.Patches;
 
 /// <summary>
-/// Rosary stringing machines use CostReference + TakeCurrency + CollectableItemCollect (not ShopItem).
+/// Rosary stringing machines: if confirm already chose a quantity, multiply Take/Collect.
+/// Otherwise fall back to opening the native DialogueYesNoBox (with qty session).
 /// </summary>
 [HarmonyPatch]
 internal static class MachinePurchasePatches
 {
     private static int _pendingCollectQty;
     private static bool _skipNextCollect;
-    private static bool _waitingForPicker;
+    private static bool _waitingForConfirm;
     private static CollectableItem? _pendingItem;
+    private static TakeCurrency? _heldTakeAction;
+    private static int _heldUnitCost;
+    private static CurrencyType _heldCurrency;
 
     [HarmonyPrefix]
     [HarmonyPatch(typeof(TakeCurrency), nameof(TakeCurrency.OnEnter))]
     private static bool TakeCurrencyPrefix(TakeCurrency __instance)
     {
-        if (!MerchantStackerPlugin.Enabled.Value || PurchaseBatcher.IsBatching || _waitingForPicker)
+        if (!MerchantStackerPlugin.Enabled.Value || PurchaseBatcher.IsBatching || _waitingForConfirm)
         {
             return true;
         }
@@ -31,61 +35,101 @@ internal static class MachinePurchasePatches
             return true;
         }
 
+        // Confirm dialog already chose quantity (merchant-style machine flow).
+        int pendingQty = PurchaseBatcher.ConsumePendingQuantity();
+        if (pendingQty > 1 && IsRosaryStringMachine(__instance))
+        {
+            var currency = (CurrencyType)(object)__instance.CurrencyType.Value;
+            int unitCost = __instance.Amount.Value;
+            CurrencyManager.TakeCurrency(unitCost * pendingQty, currency);
+            _pendingCollectQty = pendingQty;
+            _skipNextCollect = false;
+            __instance.Finish();
+            return false;
+        }
+
+        if (pendingQty == 1)
+        {
+            // Single purchase via native confirm — let vanilla TakeCurrency run.
+            return true;
+        }
+
         if (!IsRosaryStringMachine(__instance))
         {
             return true;
         }
 
-        var currency = (CurrencyType)(object)__instance.CurrencyType.Value;
-        int unitCost = __instance.Amount.Value;
-
+        var currencyType = (CurrencyType)(object)__instance.CurrencyType.Value;
+        int unit = __instance.Amount.Value;
         CollectableItem? item = FindMachineCollectable(__instance);
         int room = item != null ? Eligibility.GetRoomUntilCap(item) : 20;
-        int affordable = Eligibility.GetAffordableCount(unitCost, currency);
+        int affordable = Eligibility.GetAffordableCount(unit, currencyType);
         int max = System.Math.Max(1, System.Math.Min(room, affordable));
 
-        if (max <= 1 || affordable < 1)
+        if (max <= 1 || item == null)
         {
             return true;
         }
 
-        string title = item != null ? item.GetPopupName() : "Rosary String";
-        _waitingForPicker = true;
+        // No prior confirm with qty — open native yes/no (ConfirmDialogPatches adds qty).
+        _waitingForConfirm = true;
+        _heldTakeAction = __instance;
+        _heldUnitCost = unit;
+        _heldCurrency = currencyType;
         _pendingItem = item;
 
-        QuantityPicker.Instance.Open(
-            title,
-            unitCost,
-            currency,
-            max,
-            onConfirm: qty =>
-            {
-                _waitingForPicker = false;
-                if (qty <= 0)
-                {
-                    _skipNextCollect = true;
-                    _pendingCollectQty = 0;
-                    __instance.Finish();
-                    return;
-                }
-
-                CurrencyManager.TakeCurrency(unitCost * qty, currency);
-                _pendingCollectQty = qty;
-                _skipNextCollect = false;
-                __instance.Finish();
-            },
-            onCancel: () =>
-            {
-                _waitingForPicker = false;
-                _skipNextCollect = true;
-                _pendingCollectQty = 0;
-                __instance.Finish();
-            });
+        string prompt = item.GetPopupName();
+        DialogueYesNoBox.Open(
+            yes: OnMachineConfirmYes,
+            no: OnMachineConfirmNo,
+            returnHud: true,
+            text: prompt,
+            currencyType: currencyType,
+            currencyAmount: unit,
+            items: null,
+            amounts: null,
+            displayHudPopup: true,
+            consumeCurrency: false,
+            willGetItem: item,
+            takeItemType: TakeItemTypes.Silent,
+            displayType: YesNoAction.DisplayType.WillGetItems);
 
         return false;
     }
 
-    // OnEnter is declared on CollectableItemAction, not CollectableItemCollect.
+    private static void OnMachineConfirmYes()
+    {
+        _waitingForConfirm = false;
+        int qty = PurchaseBatcher.ConsumePendingQuantity();
+        if (qty < 1)
+        {
+            qty = 1;
+        }
+
+        var action = _heldTakeAction;
+        _heldTakeAction = null;
+        if (action == null)
+        {
+            return;
+        }
+
+        CurrencyManager.TakeCurrency(_heldUnitCost * qty, _heldCurrency);
+        _pendingCollectQty = qty;
+        _skipNextCollect = false;
+        action.Finish();
+    }
+
+    private static void OnMachineConfirmNo()
+    {
+        _waitingForConfirm = false;
+        PurchaseBatcher.ClearPendingQuantity();
+        _skipNextCollect = true;
+        _pendingCollectQty = 0;
+        var action = _heldTakeAction;
+        _heldTakeAction = null;
+        action?.Finish();
+    }
+
     [HarmonyPrefix]
     [HarmonyPatch(typeof(CollectableItemAction), nameof(CollectableItemAction.OnEnter))]
     private static bool CollectOnEnterPrefix(CollectableItemAction __instance)
@@ -168,7 +212,6 @@ internal static class MachinePurchasePatches
                 }
             }
 
-            // Scan upcoming CollectableItemCollect actions in this FSM for the item reference.
             foreach (FsmState state in fsm.States)
             {
                 foreach (FsmStateAction stateAction in state.Actions)
@@ -189,7 +232,6 @@ internal static class MachinePurchasePatches
             MerchantStackerPlugin.Log.LogDebug($"FindMachineCollectable: {ex.Message}");
         }
 
-        // Vanilla machine grants the small rosary string.
         return CollectableItemManager.GetItemByName("Rosary_Set_Small");
     }
 

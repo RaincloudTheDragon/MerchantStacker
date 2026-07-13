@@ -12,7 +12,7 @@ public class MerchantStackerPlugin : BaseUnityPlugin
 {
     public const string PluginGuid = "io.github.raincloudthedragon.merchantstacker";
     public const string PluginName = "MerchantStacker";
-    public const string PluginVersion = "0.1.1";
+    public const string PluginVersion = "0.1.2";
 
     internal static MerchantStackerPlugin Instance { get; private set; } = null!;
     internal static ManualLogSource Log { get; private set; } = null!;
@@ -44,6 +44,7 @@ public class MerchantStackerPlugin : BaseUnityPlugin
         pickerGo.AddComponent<QuantityPicker>();
 
         _harmony = new Harmony(PluginGuid);
+        TryPatch(typeof(ConfirmDialogPatches));
         TryPatch(typeof(ShopPurchasePatches));
         TryPatch(typeof(SimpleShopPatches));
         TryPatch(typeof(MachinePurchasePatches));

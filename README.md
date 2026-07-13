@@ -4,10 +4,9 @@ QOL mod for Hollow Knight: Silksong — buy stackable merchant refills (rosary s
 
 ## Features
 
-- On eligible **infinite-stock** shop items with a stack ceiling, confirm opens a **quantity submenu**
-- **D-pad** up/down: ±1 (hold to accelerate)
-- **Right stick** up/down: ±5 (hold to accelerate)
-- Quantity is clamped by what you can afford and room until the inventory cap
+- On eligible **infinite-stock** shop items with a stack ceiling, the normal purchase confirm becomes a **quantity confirm**
+- Same Silksong yes/no dialog — **d-pad** ±1 / **right stick** ±5 (hold accelerates); cost and item count update live
+- Confirm buys that many; cancel backs out with no purchase
 - Works for **merchant shops** and **rosary stringing machines** (e.g. Greymoor)
 
 ## Install

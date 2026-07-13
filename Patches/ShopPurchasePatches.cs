@@ -11,7 +11,7 @@ internal static class ShopPurchasePatches
     [HarmonyPatch(typeof(SetShopItemPurchased), nameof(SetShopItemPurchased.OnEnter))]
     private static bool SetPurchasedPrefix(SetShopItemPurchased __instance)
     {
-        return TryIntercept(__instance, subItemIndex: 0);
+        return TryBatch(__instance, subItemIndex: 0);
     }
 
     [HarmonyPrefix]
@@ -19,17 +19,17 @@ internal static class ShopPurchasePatches
     private static bool SetPurchasedV2Prefix(SetShopItemPurchasedV2 __instance)
     {
         int sub = __instance.SubItemIndex != null ? __instance.SubItemIndex.Value : 0;
-        return TryIntercept(__instance, sub);
+        return TryBatch(__instance, sub);
     }
 
-    private static bool TryIntercept(SetShopItemPurchased action, int subItemIndex)
+    private static bool TryBatch(SetShopItemPurchased action, int subItemIndex)
     {
-        if (!MerchantStackerPlugin.Enabled.Value || PurchaseBatcher.IsBatching || QuantityPicker.Instance.IsOpen)
+        int qty = PurchaseBatcher.ConsumePendingQuantity();
+        if (qty <= 1 || PurchaseBatcher.IsBatching)
         {
             return true;
         }
 
-        action.IsWaitingBool.Value = false;
         GameObject? target = action.Target.GetSafe(action);
         if (target == null)
         {
@@ -37,60 +37,32 @@ internal static class ShopPurchasePatches
         }
 
         var stats = target.GetComponent<ShopItemStats>();
-        if (stats == null || !Eligibility.IsBulkEligible(stats.Item))
-        {
-            return true;
-        }
-
-        int max = Eligibility.GetMaxQuantity(stats.Item);
-        if (max <= 1)
+        if (stats == null || stats.Item == null)
         {
             return true;
         }
 
         action.IsWaitingBool.Value = true;
-        string title = stats.Item.DisplayName;
-        int cost = stats.Item.Cost;
-        var currency = stats.Item.CurrencyType;
-
-        QuantityPicker.Instance.Open(
-            title,
-            cost,
-            currency,
-            max,
-            onConfirm: qty =>
+        PurchaseBatcher.BuyShopItem(stats, qty, subItemIndex, () =>
+        {
+            action.IsWaitingBool.Value = false;
+            if (GameCameras.instance != null)
             {
-                PurchaseBatcher.BuyShopItem(stats, qty, subItemIndex, () =>
-                {
-                    action.IsWaitingBool.Value = false;
-                    if (GameCameras.instance != null)
-                    {
-                        GameCameras.instance.HUDIn();
-                    }
-                });
-            },
-            onCancel: () =>
-            {
-                action.IsWaitingBool.Value = false;
-                EventRegister.SendEvent(EventRegisterEvents.ResetShopWindow);
-                if (GameCameras.instance != null)
-                {
-                    GameCameras.instance.HUDIn();
-                }
-            });
-
+                GameCameras.instance.HUDIn();
+            }
+        });
         action.Finish();
         return false;
     }
 
-    private static bool TryIntercept(SetShopItemPurchasedV2 action, int subItemIndex)
+    private static bool TryBatch(SetShopItemPurchasedV2 action, int subItemIndex)
     {
-        if (!MerchantStackerPlugin.Enabled.Value || PurchaseBatcher.IsBatching || QuantityPicker.Instance.IsOpen)
+        int qty = PurchaseBatcher.ConsumePendingQuantity();
+        if (qty <= 1 || PurchaseBatcher.IsBatching)
         {
             return true;
         }
 
-        action.IsWaitingBool.Value = false;
         GameObject? target = action.Target.GetSafe(action);
         if (target == null)
         {
@@ -98,48 +70,20 @@ internal static class ShopPurchasePatches
         }
 
         var stats = target.GetComponent<ShopItemStats>();
-        if (stats == null || !Eligibility.IsBulkEligible(stats.Item))
-        {
-            return true;
-        }
-
-        int max = Eligibility.GetMaxQuantity(stats.Item);
-        if (max <= 1)
+        if (stats == null || stats.Item == null)
         {
             return true;
         }
 
         action.IsWaitingBool.Value = true;
-        string title = stats.Item.DisplayName;
-        int cost = stats.Item.Cost;
-        var currency = stats.Item.CurrencyType;
-
-        QuantityPicker.Instance.Open(
-            title,
-            cost,
-            currency,
-            max,
-            onConfirm: qty =>
+        PurchaseBatcher.BuyShopItem(stats, qty, subItemIndex, () =>
+        {
+            action.IsWaitingBool.Value = false;
+            if (GameCameras.instance != null)
             {
-                PurchaseBatcher.BuyShopItem(stats, qty, subItemIndex, () =>
-                {
-                    action.IsWaitingBool.Value = false;
-                    if (GameCameras.instance != null)
-                    {
-                        GameCameras.instance.HUDIn();
-                    }
-                });
-            },
-            onCancel: () =>
-            {
-                action.IsWaitingBool.Value = false;
-                EventRegister.SendEvent(EventRegisterEvents.ResetShopWindow);
-                if (GameCameras.instance != null)
-                {
-                    GameCameras.instance.HUDIn();
-                }
-            });
-
+                GameCameras.instance.HUDIn();
+            }
+        });
         action.Finish();
         return false;
     }

@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using System.Reflection;
 using HarmonyLib;
 using UnityEngine;
@@ -10,9 +9,6 @@ internal static class SimpleShopPatches
 {
     private static readonly FieldInfo SelectedIndexField =
         AccessTools.Field(typeof(SimpleShopMenu), "selectedIndex");
-
-    private static readonly FieldInfo ShopItemsField =
-        AccessTools.Field(typeof(SimpleShopMenu), "shopItems");
 
     private static readonly FieldInfo OwnerField =
         AccessTools.Field(typeof(SimpleShopMenu), "owner");
@@ -30,6 +26,10 @@ internal static class SimpleShopPatches
         AccessTools.Field(typeof(SimpleShopMenu), "purchasedIndex");
 
     private static bool _handlingBulk;
+    private static SimpleShopMenu? _pendingMenu;
+    private static SimpleShopMenuOwner? _pendingOwner;
+    private static int _pendingIndex;
+    private static int _pendingUnitCost;
 
     [HarmonyPrefix]
     [HarmonyPatch(typeof(SimpleShopMenu), "OnSubmitPressed")]
@@ -65,13 +65,13 @@ internal static class SimpleShopPatches
             return true;
         }
 
-        // Simple shop items are not always ShopItem; only intercept when we can resolve a stackable collectable.
-        if (!TryGetBulkInfo(item, out string title, out int maxQty))
+        if (!TryExtractShopItem(item, out ShopItem? shopItem) || shopItem == null || !Eligibility.IsBulkEligible(shopItem))
         {
             return true;
         }
 
-        if (maxQty <= 1)
+        int maxQty = Eligibility.GetMaxQuantity(shopItem);
+        if (maxQty <= 1 || shopItem.Item is not CollectableItem collectable)
         {
             return true;
         }
@@ -79,15 +79,64 @@ internal static class SimpleShopPatches
         int selectedIndex = (int)SelectedIndexField.GetValue(__instance)!;
         var owner = (SimpleShopMenuOwner)OwnerField.GetValue(__instance)!;
 
-        QuantityPicker.Instance.Open(
-            title,
-            cost,
-            CurrencyType.Money,
-            maxQty,
-            onConfirm: qty => ApplySimpleShopBulk(__instance, owner, selectedIndex, cost, qty),
-            onCancel: () => { });
+        _pendingMenu = __instance;
+        _pendingOwner = owner;
+        _pendingIndex = selectedIndex;
+        _pendingUnitCost = cost;
+
+        // Native confirm (ConfirmDialogPatches attaches quantity controls).
+        DialogueYesNoBox.Open(
+            yes: OnSimpleConfirmYes,
+            no: OnSimpleConfirmNo,
+            returnHud: true,
+            text: shopItem.DisplayName,
+            currencyType: shopItem.CurrencyType,
+            currencyAmount: cost,
+            items: null,
+            amounts: null,
+            displayHudPopup: true,
+            consumeCurrency: false,
+            willGetItem: collectable,
+            takeItemType: TakeItemTypes.Silent,
+            displayType: YesNoAction.DisplayType.WillGetItems);
 
         return false;
+    }
+
+    private static void OnSimpleConfirmYes()
+    {
+        var menu = _pendingMenu;
+        var owner = _pendingOwner;
+        int index = _pendingIndex;
+        int unitCost = _pendingUnitCost;
+        ClearPending();
+
+        if (menu == null || owner == null)
+        {
+            return;
+        }
+
+        int qty = PurchaseBatcher.ConsumePendingQuantity();
+        if (qty < 1)
+        {
+            qty = 1;
+        }
+
+        ApplySimpleShopBulk(menu, owner, index, unitCost, qty);
+    }
+
+    private static void OnSimpleConfirmNo()
+    {
+        PurchaseBatcher.ClearPendingQuantity();
+        ClearPending();
+    }
+
+    private static void ClearPending()
+    {
+        _pendingMenu = null;
+        _pendingOwner = null;
+        _pendingIndex = -1;
+        _pendingUnitCost = 0;
     }
 
     private static void ApplySimpleShopBulk(
@@ -143,44 +192,6 @@ internal static class SimpleShopPatches
         {
             _handlingBulk = false;
         }
-    }
-
-    private static bool TryGetBulkInfo(ISimpleShopItem item, out string title, out int maxQty)
-    {
-        title = item.GetDisplayName();
-        maxQty = 1;
-
-        // Heuristic: if the display name looks like a known refill, allow bulk by geo only (cap 20).
-        // Caravan/quest simple shops usually DelayPurchase or are unique — skip those.
-        if (item.DelayPurchase())
-        {
-            return false;
-        }
-
-        int cost = item.GetCost();
-        int affordable = Eligibility.GetAffordableCount(cost, CurrencyType.Money);
-        if (affordable <= 1)
-        {
-            return false;
-        }
-
-        // Prefer resolving via ShopItem if the concrete type wraps one.
-        if (TryExtractShopItem(item, out ShopItem? shopItem) && shopItem != null)
-        {
-            if (!Eligibility.IsBulkEligible(shopItem))
-            {
-                return false;
-            }
-
-            title = shopItem.DisplayName;
-            maxQty = Eligibility.GetMaxQuantity(shopItem);
-            return maxQty > 1;
-        }
-
-        // Rosary-machine-like simple stock: infinite + stackable naming is unreliable.
-        // Only auto-bulk when affordable > 1 and cost matches typical refill prices is too magic.
-        // Leave non-ShopItem simple shops to MachinePurchasePatches / merchant path.
-        return false;
     }
 
     private static bool TryExtractShopItem(ISimpleShopItem item, out ShopItem? shopItem)

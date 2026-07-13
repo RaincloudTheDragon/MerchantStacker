@@ -1,24 +1,42 @@
 using System;
+using System.Collections.Generic;
+using System.Reflection;
+using HarmonyLib;
+using TMProOld;
 using UnityEngine;
 
 namespace MerchantStacker;
 
 /// <summary>
-/// Quantity submenu: d-pad ±step, right stick ±larger step, hold to accelerate.
+/// Quantity adjustment layered on Silksong's native DialogueYesNoBox confirm UI.
+/// Up/down change count; cost and item amount update live on the existing box.
 /// </summary>
 internal sealed class QuantityPicker : MonoBehaviour
 {
     internal static QuantityPicker Instance { get; private set; } = null!;
 
-    private bool _active;
+    private static readonly FieldInfo InstanceField =
+        AccessTools.Field(typeof(DialogueYesNoBox), "_instance");
+
+    private static readonly FieldInfo RequiredCurrencyAmountField =
+        AccessTools.Field(typeof(DialogueYesNoBox), "requiredCurrencyAmount");
+
+    private static readonly FieldInfo CurrencyTextField =
+        AccessTools.Field(typeof(DialogueYesNoBox), "currencyText");
+
+    private static readonly FieldInfo InstantiatedItemsField =
+        AccessTools.Field(typeof(DialogueYesNoBox), "instantiatedItems");
+
+    private static readonly FieldInfo WillGetItemField =
+        AccessTools.Field(typeof(DialogueYesNoBox), "willGetItem");
+
+    private bool _sessionActive;
     private int _quantity = 1;
     private int _min = 1;
     private int _max = 1;
     private int _unitCost;
     private CurrencyType _currency;
-    private string _title = "Buy";
-    private Action<int>? _onConfirm;
-    private Action? _onCancel;
+    private CollectableItem? _willGetItem;
 
     private float _upTimer;
     private float _downTimer;
@@ -28,83 +46,71 @@ internal sealed class QuantityPicker : MonoBehaviour
     private bool _downHeld;
     private int _heldStep;
 
-    private GUIStyle? _panelStyle;
-    private GUIStyle? _titleStyle;
-    private GUIStyle? _qtyStyle;
-    private GUIStyle? _hintStyle;
-    private GUIStyle? _arrowStyle;
-    private Texture2D? _panelTex;
-
     private void Awake()
     {
         Instance = this;
     }
 
-    public bool IsOpen => _active;
+    public bool IsOpen => _sessionActive;
 
-    public void Open(
-        string title,
-        int unitCost,
-        CurrencyType currency,
-        int maxQuantity,
-        Action<int> onConfirm,
-        Action onCancel)
+    public int CurrentQuantity => _quantity;
+
+    /// <summary>
+    /// Begin adjusting quantity on the currently opening DialogueYesNoBox.
+    /// </summary>
+    public void BeginNativeSession(CollectableItem willGetItem, int unitCost, CurrencyType currency, int maxQuantity)
     {
-        if (!MerchantStackerPlugin.Enabled.Value || maxQuantity < 1)
-        {
-            onConfirm(1);
-            return;
-        }
-
-        _title = string.IsNullOrEmpty(title) ? "Buy" : title;
-        _unitCost = Math.Max(0, unitCost);
+        _willGetItem = willGetItem;
+        _unitCost = Math.Max(1, unitCost);
         _currency = currency;
         _min = 1;
         _max = Math.Max(1, maxQuantity);
         _quantity = 1;
-        _onConfirm = onConfirm;
-        _onCancel = onCancel;
-        _active = true;
+        _sessionActive = true;
+        PurchaseBatcher.PendingQuantity = 1;
         ResetHoldState();
-        MerchantStackerPlugin.Log.LogDebug($"Quantity picker open: {_title} max={_max} cost={_unitCost}");
+        // Defer one frame so Open finishes wiring the box.
+        StartCoroutine(RefreshNextFrame());
+        MerchantStackerPlugin.Log.LogDebug($"Native qty session: {willGetItem.GetPopupName()} max={_max} cost={_unitCost}");
     }
 
-    public void Close()
+    public void EndSession()
     {
-        _active = false;
-        _onConfirm = null;
-        _onCancel = null;
+        _sessionActive = false;
+        _willGetItem = null;
         ResetHoldState();
     }
 
-    private void ResetHoldState()
+    private System.Collections.IEnumerator RefreshNextFrame()
     {
-        _upTimer = 0f;
-        _downTimer = 0f;
-        _upHeld = false;
-        _downHeld = false;
-        _upInterval = MerchantStackerPlugin.HoldInitialDelay.Value;
-        _downInterval = MerchantStackerPlugin.HoldInitialDelay.Value;
-        _heldStep = MerchantStackerPlugin.DpadStep.Value;
+        yield return null;
+        if (_sessionActive)
+        {
+            RefreshNativeDisplay();
+        }
     }
 
     private void Update()
     {
-        if (!_active)
+        if (!_sessionActive)
         {
             return;
         }
 
-        // Refresh max in case currency/cap changed while open.
-        int affordable = Eligibility.GetAffordableCount(_unitCost, _currency);
-        if (affordable < _max)
+        // Session ends when the confirm box instance goes away / closes.
+        if (InstanceField.GetValue(null) == null)
         {
-            _max = Math.Max(1, affordable);
+            EndSession();
+            return;
         }
 
+        int affordable = Eligibility.GetAffordableCount(_unitCost, _currency);
+        int room = _willGetItem != null ? Eligibility.GetRoomUntilCap(_willGetItem) : _max;
+        _max = Math.Max(1, Math.Min(affordable, room));
         if (_quantity > _max)
         {
             _quantity = _max;
+            RefreshNativeDisplay();
         }
 
         var ih = ManagerSingleton<InputHandler>.Instance;
@@ -114,17 +120,7 @@ internal sealed class QuantityPicker : MonoBehaviour
         }
 
         var actions = ih.inputActions;
-        var platform = Platform.Current;
-
-        switch (platform.GetMenuAction(actions))
-        {
-            case Platform.MenuActions.Submit:
-                Confirm();
-                return;
-            case Platform.MenuActions.Cancel:
-                Cancel();
-                return;
-        }
+        // Do not steal Submit/Cancel — DialogueYesNoBox yes/no handles those.
 
         int dpad = MerchantStackerPlugin.DpadStep.Value;
         int stick = MerchantStackerPlugin.StickStep.Value;
@@ -215,111 +211,77 @@ internal sealed class QuantityPicker : MonoBehaviour
 
     private void Adjust(int delta)
     {
-        _quantity = Math.Clamp(_quantity + delta, _min, _max);
-    }
-
-    private void Confirm()
-    {
-        if (!_active)
+        int next = Math.Clamp(_quantity + delta, _min, _max);
+        if (next == _quantity)
         {
             return;
         }
 
-        int qty = _quantity;
-        var cb = _onConfirm;
-        Close();
-        cb?.Invoke(qty);
+        _quantity = next;
+        PurchaseBatcher.PendingQuantity = _quantity;
+        RefreshNativeDisplay();
     }
 
-    private void Cancel()
+    private void ResetHoldState()
     {
-        if (!_active)
+        _upTimer = 0f;
+        _downTimer = 0f;
+        _upHeld = false;
+        _downHeld = false;
+        _upInterval = MerchantStackerPlugin.HoldInitialDelay.Value;
+        _downInterval = MerchantStackerPlugin.HoldInitialDelay.Value;
+        _heldStep = MerchantStackerPlugin.DpadStep.Value;
+    }
+
+    private void RefreshNativeDisplay()
+    {
+        var box = InstanceField.GetValue(null) as DialogueYesNoBox;
+        if (box == null)
         {
             return;
         }
 
-        var cb = _onCancel;
-        Close();
-        cb?.Invoke();
-    }
+        int totalCost = _unitCost * _quantity;
+        RequiredCurrencyAmountField.SetValue(box, totalCost);
 
-    private void OnGUI()
-    {
-        if (!_active)
+        if (CurrencyTextField.GetValue(box) is TMP_Text currencyText)
         {
-            return;
+            currencyText.text = totalCost > 0 ? totalCost.ToString(System.Globalization.CultureInfo.InvariantCulture) : string.Empty;
         }
 
-        EnsureStyles();
-
-        float w = 420f;
-        float h = 220f;
-        var rect = new Rect((Screen.width - w) * 0.5f, (Screen.height - h) * 0.5f, w, h);
-        GUI.Box(rect, GUIContent.none, _panelStyle);
-
-        var titleRect = new Rect(rect.x, rect.y + 16f, rect.width, 28f);
-        GUI.Label(titleRect, _title, _titleStyle);
-
-        var arrowUp = new Rect(rect.x, rect.y + 52f, rect.width, 28f);
-        GUI.Label(arrowUp, "▲", _arrowStyle);
-
-        var qtyRect = new Rect(rect.x, rect.y + 82f, rect.width, 56f);
-        GUI.Label(qtyRect, _quantity.ToString(System.Globalization.CultureInfo.InvariantCulture), _qtyStyle);
-
-        var arrowDown = new Rect(rect.x, rect.y + 138f, rect.width, 28f);
-        GUI.Label(arrowDown, "▼", _arrowStyle);
-
-        int total = _unitCost * _quantity;
-        string currency = _currency == CurrencyType.Shard ? "Shards" : "Rosaries";
-        var hint = new Rect(rect.x + 12f, rect.y + h - 40f, rect.width - 24f, 28f);
-        GUI.Label(hint, $"Total {total} {currency}  ·  D-pad ±{MerchantStackerPlugin.DpadStep.Value}  ·  RS ±{MerchantStackerPlugin.StickStep.Value}", _hintStyle);
-    }
-
-    private void EnsureStyles()
-    {
-        if (_panelStyle != null)
+        if (_willGetItem != null && InstantiatedItemsField.GetValue(box) is List<SavedItemDisplay> items)
         {
-            return;
+            foreach (SavedItemDisplay display in items)
+            {
+                if (display != null && display.gameObject.activeSelf)
+                {
+                    // Force amount text even if DisplayAmount is false for some items.
+                    display.Setup(_willGetItem, _quantity);
+                    TryForceAmountText(display, _quantity);
+                    break;
+                }
+            }
         }
 
-        _panelTex = new Texture2D(1, 1);
-        _panelTex.SetPixel(0, 0, new Color(0.05f, 0.05f, 0.08f, 0.92f));
-        _panelTex.Apply();
+        // Keep willGetItem reference in sync for InactiveYesText / at-max checks.
+        WillGetItemField.SetValue(box, _willGetItem);
+    }
 
-        _panelStyle = new GUIStyle(GUI.skin.box)
+    private static void TryForceAmountText(SavedItemDisplay display, int qty)
+    {
+        try
         {
-            normal = { background = _panelTex },
-        };
-
-        _titleStyle = new GUIStyle(GUI.skin.label)
+            var amountField = AccessTools.Field(typeof(SavedItemDisplay), "amountText");
+            if (amountField?.GetValue(display) is TMP_Text amountText)
+            {
+                amountText.text = qty > 1
+                    ? qty.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    : string.Empty;
+            }
+        }
+        catch
         {
-            alignment = TextAnchor.MiddleCenter,
-            fontSize = 18,
-            fontStyle = FontStyle.Bold,
-            normal = { textColor = new Color(0.92f, 0.9f, 0.82f) },
-        };
-
-        _qtyStyle = new GUIStyle(GUI.skin.label)
-        {
-            alignment = TextAnchor.MiddleCenter,
-            fontSize = 42,
-            fontStyle = FontStyle.Bold,
-            normal = { textColor = Color.white },
-        };
-
-        _arrowStyle = new GUIStyle(GUI.skin.label)
-        {
-            alignment = TextAnchor.MiddleCenter,
-            fontSize = 22,
-            normal = { textColor = new Color(0.75f, 0.78f, 0.85f) },
-        };
-
-        _hintStyle = new GUIStyle(GUI.skin.label)
-        {
-            alignment = TextAnchor.MiddleCenter,
-            fontSize = 12,
-            normal = { textColor = new Color(0.7f, 0.7f, 0.75f) },
-            wordWrap = true,
-        };
+            // ignored
+        }
     }
 }

@@ -5,9 +5,26 @@ namespace MerchantStacker;
 internal static class PurchaseBatcher
 {
     /// <summary>
-    /// True while we are applying a multi-buy so nested hooks do not re-open the picker.
+    /// Quantity chosen on the native confirm dialog; consumed by purchase / machine hooks.
+    /// </summary>
+    internal static int PendingQuantity { get; set; }
+
+    /// <summary>
+    /// True while we are applying a multi-buy so nested hooks do not re-enter.
     /// </summary>
     internal static bool IsBatching { get; private set; }
+
+    internal static void ClearPendingQuantity()
+    {
+        PendingQuantity = 0;
+    }
+
+    internal static int ConsumePendingQuantity()
+    {
+        int qty = PendingQuantity;
+        PendingQuantity = 0;
+        return qty;
+    }
 
     internal static void BuyShopItem(ShopItemStats stats, int quantity, int subItemIndex, Action? onComplete)
     {
