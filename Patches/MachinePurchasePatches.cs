@@ -71,63 +71,46 @@ internal static class MachinePurchasePatches
             return true;
         }
 
-        // No prior confirm with qty — open native yes/no (ConfirmDialogPatches adds qty).
+        // Open quantity picker (owns pad; native confirm blocks vertical input).
         _waitingForConfirm = true;
         _heldTakeAction = __instance;
         _heldUnitCost = unit;
         _heldCurrency = currencyType;
         _pendingItem = item;
 
-        string prompt = item.GetPopupName();
-        DialogueYesNoBox.Open(
-            yes: OnMachineConfirmYes,
-            no: OnMachineConfirmNo,
-            returnHud: true,
-            text: prompt,
-            currencyType: currencyType,
-            currencyAmount: unit,
-            items: null,
-            amounts: null,
-            displayHudPopup: true,
-            consumeCurrency: false,
-            willGetItem: item,
-            takeItemType: TakeItemTypes.Silent,
-            displayType: YesNoAction.DisplayType.WillGetItems);
+        QuantityPicker.Instance.Open(
+            title: item.GetPopupName(),
+            item: item,
+            unitCost: unit,
+            currency: currencyType,
+            maxQuantity: max,
+            onConfirm: qty =>
+            {
+                _waitingForConfirm = false;
+                var action = _heldTakeAction;
+                _heldTakeAction = null;
+                if (action == null)
+                {
+                    return;
+                }
+
+                CurrencyManager.TakeCurrency(_heldUnitCost * qty, _heldCurrency);
+                _pendingCollectQty = qty;
+                _skipNextCollect = false;
+                action.Finish();
+            },
+            onCancel: () =>
+            {
+                _waitingForConfirm = false;
+                PurchaseBatcher.ClearPendingQuantity();
+                _skipNextCollect = true;
+                _pendingCollectQty = 0;
+                var action = _heldTakeAction;
+                _heldTakeAction = null;
+                action?.Finish();
+            });
 
         return false;
-    }
-
-    private static void OnMachineConfirmYes()
-    {
-        _waitingForConfirm = false;
-        int qty = PurchaseBatcher.ConsumePendingQuantity();
-        if (qty < 1)
-        {
-            qty = 1;
-        }
-
-        var action = _heldTakeAction;
-        _heldTakeAction = null;
-        if (action == null)
-        {
-            return;
-        }
-
-        CurrencyManager.TakeCurrency(_heldUnitCost * qty, _heldCurrency);
-        _pendingCollectQty = qty;
-        _skipNextCollect = false;
-        action.Finish();
-    }
-
-    private static void OnMachineConfirmNo()
-    {
-        _waitingForConfirm = false;
-        PurchaseBatcher.ClearPendingQuantity();
-        _skipNextCollect = true;
-        _pendingCollectQty = 0;
-        var action = _heldTakeAction;
-        _heldTakeAction = null;
-        action?.Finish();
     }
 
     [HarmonyPrefix]

@@ -44,7 +44,10 @@ public class MerchantStackerPlugin : BaseUnityPlugin
         pickerGo.AddComponent<QuantityPicker>();
 
         _harmony = new Harmony(PluginGuid);
+        TryPatch(typeof(ShopSelectionCachePatches));
+        TryPatch(typeof(ShopConfirmListPatches));
         TryPatch(typeof(ConfirmDialogPatches));
+        TryPatch(typeof(InventoryPaneInputPatches));
         TryPatch(typeof(ShopPurchasePatches));
         TryPatch(typeof(SimpleShopPatches));
         TryPatch(typeof(MachinePurchasePatches));

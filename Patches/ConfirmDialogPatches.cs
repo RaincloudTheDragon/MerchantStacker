@@ -1,271 +1,107 @@
 using System;
-using System.Collections.Generic;
+using System.Reflection;
 using HarmonyLib;
 using UnityEngine;
 
 namespace MerchantStacker.Patches;
 
 /// <summary>
-/// Hooks Silksong's purchase confirm box so quantity adjust happens on that UI
-/// instead of showing a second placeholder menu afterward.
+/// Optional arming when something else opens DialogueYesNoBox (not merchant shop panes).
+/// Merchant shops use in-pane qty via ShopConfirmListPatches — never open a second box.
 /// </summary>
 [HarmonyPatch]
 internal static class ConfirmDialogPatches
 {
-    [HarmonyPrefix]
-    [HarmonyPatch(
-        typeof(DialogueYesNoBox),
-        nameof(DialogueYesNoBox.Open),
-        new Type[]
-        {
-            typeof(Action),
-            typeof(Action),
-            typeof(bool),
-            typeof(string),
-            typeof(CurrencyType),
-            typeof(int),
-            typeof(IReadOnlyList<SavedItem>),
-            typeof(IReadOnlyList<int>),
-            typeof(bool),
-            typeof(bool),
-            typeof(SavedItem),
-            typeof(TakeItemTypes),
-            typeof(YesNoAction.DisplayType),
-        })]
-    private static void OpenPrefix(
-        ref Action yes,
-        ref Action no,
-        CurrencyType currencyType,
-        int currencyAmount,
-        IReadOnlyList<SavedItem> items,
-        ref bool consumeCurrency,
-        ref SavedItem willGetItem,
-        ref YesNoAction.DisplayType displayType)
+    private static readonly FieldInfo CurrentYesField =
+        AccessTools.Field(typeof(YesNoBox), "currentYes");
+
+    private static readonly FieldInfo CurrentNoField =
+        AccessTools.Field(typeof(YesNoBox), "currentNo");
+
+    private static readonly FieldInfo RequiredCurrencyAmountField =
+        AccessTools.Field(typeof(DialogueYesNoBox), "requiredCurrencyAmount");
+
+    private static readonly FieldInfo WillGetItemField =
+        AccessTools.Field(typeof(DialogueYesNoBox), "willGetItem");
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(YesNoBox), "InternalOpen")]
+    private static void InternalOpenPostfix(YesNoBox __instance)
     {
-        if (!MerchantStackerPlugin.Enabled.Value || PurchaseBatcher.IsBatching)
+        try
         {
-            return;
+            if (!MerchantStackerPlugin.Enabled.Value
+                || PurchaseBatcher.IsBatching
+                || QuantityPicker.SuppressHijack
+                || QuantityPicker.Instance == null
+                || QuantityPicker.Instance.IsOpen
+                || __instance is not DialogueYesNoBox box)
+            {
+                return;
+            }
+
+            // Skip if a merchant shop pane is open — qty belongs in that pane.
+            if (IsMerchantShopOpen())
+            {
+                return;
+            }
+
+            int cost = RequiredCurrencyAmountField?.GetValue(box) as int? ?? 0;
+            if (cost <= 0)
+            {
+                return;
+            }
+
+            ShopItemStats? stats = ShopSelectionCache.ResolveStats();
+            if (stats?.Item == null
+                || !Eligibility.IsBulkEligible(stats.Item)
+                || Eligibility.GetMaxQuantity(stats.Item) <= 1)
+            {
+                return;
+            }
+
+            CollectableItem? collectable =
+                WillGetItemField?.GetValue(box) as CollectableItem
+                ?? stats.Item.Item as CollectableItem;
+            if (collectable == null)
+            {
+                return;
+            }
+
+            QuantityPicker.Instance.Hijack(
+                box,
+                title: stats.Item.DisplayName,
+                item: collectable,
+                unitCost: stats.Item.Cost > 0 ? stats.Item.Cost : cost,
+                currency: stats.Item.CurrencyType,
+                maxQuantity: Eligibility.GetMaxQuantity(stats.Item),
+                originalYes: CurrentYesField?.GetValue(box) as Action,
+                originalNo: CurrentNoField?.GetValue(box) as Action);
         }
-
-        if (!TryGetBulkTarget(
-                ref willGetItem,
-                ref displayType,
-                currencyAmount,
-                currencyType,
-                items,
-                out CollectableItem collectable,
-                out int maxQty,
-                out int unitCost))
+        catch (Exception ex)
         {
-            PurchaseBatcher.ClearPendingQuantity();
-            return;
+            MerchantStackerPlugin.Log.LogError($"ConfirmDialogPatches: {ex}");
         }
-
-        // Merchant SetPurchased always charges; confirm must not also consume.
-        consumeCurrency = false;
-
-        Action originalYes = yes;
-        Action originalNo = no;
-
-        yes = () =>
-        {
-            int qty = QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen
-                ? QuantityPicker.Instance.CurrentQuantity
-                : Math.Max(1, PurchaseBatcher.PendingQuantity);
-            PurchaseBatcher.PendingQuantity = Math.Max(1, qty);
-            QuantityPicker.Instance?.EndSession();
-            originalYes?.Invoke();
-        };
-
-        no = () =>
-        {
-            PurchaseBatcher.ClearPendingQuantity();
-            QuantityPicker.Instance?.EndSession();
-            originalNo?.Invoke();
-        };
-
-        QuantityPicker.Instance.BeginNativeSession(collectable, unitCost, currencyType, maxQty);
-        MerchantStackerPlugin.Log.LogInfo(
-            $"Qty confirm: {collectable.GetPopupName()} max={maxQty} cost={unitCost}");
     }
 
-    private static bool TryGetBulkTarget(
-        ref SavedItem willGetItem,
-        ref YesNoAction.DisplayType displayType,
-        int currencyAmount,
-        CurrencyType currencyType,
-        IReadOnlyList<SavedItem> items,
-        out CollectableItem collectable,
-        out int maxQty,
-        out int unitCost)
+    private static bool IsMerchantShopOpen()
     {
-        collectable = null!;
-        maxQty = 1;
-        unitCost = currencyAmount;
-
-        if (currencyAmount <= 0)
+        try
         {
-            return false;
-        }
-
-        // Multi-item "give/take" prompts are not shop bulk buys.
-        if (items != null && items.Count > 0)
-        {
-            return false;
-        }
-
-        CollectableItem? item = willGetItem as CollectableItem;
-        ShopItem? shopItem = null;
-
-        // Merchant confirms (e.g. Pebb) often pass currency cost only — no WillGetItem.
-        if (item == null && TryResolveSelectedShopItem(currencyAmount, currencyType, out shopItem))
-        {
-            item = shopItem!.Item as CollectableItem;
-            if (item != null)
+            foreach (ShopMenuStock stock in UnityEngine.Object.FindObjectsByType<ShopMenuStock>(
+                         FindObjectsSortMode.None))
             {
-                willGetItem = item;
-                displayType = YesNoAction.DisplayType.WillGetItems;
-                unitCost = shopItem.Cost > 0 ? shopItem.Cost : currencyAmount;
+                if (stock != null && stock.isActiveAndEnabled)
+                {
+                    return true;
+                }
             }
         }
-        else if (item != null)
+        catch
         {
-            // Ensure the will-get icon/amount row is actually created for currency prompts.
-            displayType = YesNoAction.DisplayType.WillGetItems;
-            if (TryResolveSelectedShopItem(currencyAmount, currencyType, out shopItem)
-                && shopItem!.Item == item)
-            {
-                unitCost = shopItem.Cost > 0 ? shopItem.Cost : currencyAmount;
-            }
-        }
-
-        if (item == null)
-        {
-            return false;
-        }
-
-        if (shopItem != null)
-        {
-            if (!Eligibility.IsBulkEligible(shopItem))
-            {
-                return false;
-            }
-
-            maxQty = Eligibility.GetMaxQuantity(shopItem);
-        }
-        else
-        {
-            if (!item.CanGetMore() || item.IsAtMax())
-            {
-                return false;
-            }
-
-            int room = Eligibility.GetRoomUntilCap(item);
-            int affordable = Eligibility.GetAffordableCount(unitCost, currencyType);
-            maxQty = Math.Max(1, Math.Min(room, affordable));
-        }
-
-        if (maxQty <= 1)
-        {
-            return false;
-        }
-
-        collectable = item;
-        return true;
-    }
-
-    /// <summary>
-    /// Merchant shop UI keeps the highlighted line as InventoryItemManager.CurrentSelected
-    /// (same GameObject PlayMaker stores in FSM var "Item" for SetShopItemPurchased).
-    /// </summary>
-    private static bool TryResolveSelectedShopItem(
-        int currencyAmount,
-        CurrencyType currencyType,
-        out ShopItem? shopItem)
-    {
-        shopItem = null;
-
-        foreach (InventoryItemManager manager in UnityEngine.Object.FindObjectsByType<InventoryItemManager>(FindObjectsSortMode.None))
-        {
-            if (manager == null || !manager.isActiveAndEnabled)
-            {
-                continue;
-            }
-
-            InventoryItemSelectable? selected = manager.CurrentSelected;
-            if (selected == null)
-            {
-                continue;
-            }
-
-            if (!TryGetShopItemFrom(selected.gameObject, out ShopItem? candidate) || candidate == null)
-            {
-                continue;
-            }
-
-            if (!MatchesPurchase(candidate, currencyAmount, currencyType))
-            {
-                continue;
-            }
-
-            shopItem = candidate;
-            return true;
-        }
-
-        // Fallback: PlayMaker "Item" variable written by InventoryItemManager.SetSelected.
-        foreach (PlayMakerFSM fsm in UnityEngine.Object.FindObjectsByType<PlayMakerFSM>(FindObjectsSortMode.None))
-        {
-            if (fsm == null || !fsm.isActiveAndEnabled || fsm.FsmVariables == null)
-            {
-                continue;
-            }
-
-            var itemVar = fsm.FsmVariables.FindFsmGameObject("Item");
-            if (itemVar == null || itemVar.Value == null)
-            {
-                continue;
-            }
-
-            if (!TryGetShopItemFrom(itemVar.Value, out ShopItem? candidate) || candidate == null)
-            {
-                continue;
-            }
-
-            if (!MatchesPurchase(candidate, currencyAmount, currencyType))
-            {
-                continue;
-            }
-
-            shopItem = candidate;
-            return true;
+            // ignored
         }
 
         return false;
-    }
-
-    private static bool TryGetShopItemFrom(GameObject go, out ShopItem? shopItem)
-    {
-        shopItem = null;
-        var stats = go.GetComponent<ShopItemStats>()
-            ?? go.GetComponentInChildren<ShopItemStats>(includeInactive: true)
-            ?? go.GetComponentInParent<ShopItemStats>();
-        if (stats == null || stats.Item == null)
-        {
-            return false;
-        }
-
-        shopItem = stats.Item;
-        return true;
-    }
-
-    private static bool MatchesPurchase(ShopItem item, int currencyAmount, CurrencyType currencyType)
-    {
-        if (item.CurrencyType != currencyType)
-        {
-            return false;
-        }
-
-        // CostReference / overrides can differ slightly; allow exact match only.
-        return item.Cost == currencyAmount;
     }
 }

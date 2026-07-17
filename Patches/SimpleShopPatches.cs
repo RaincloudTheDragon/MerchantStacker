@@ -71,7 +71,7 @@ internal static class SimpleShopPatches
         }
 
         int maxQty = Eligibility.GetMaxQuantity(shopItem);
-        if (maxQty <= 1 || shopItem.Item is not CollectableItem collectable)
+        if (maxQty <= 1)
         {
             return true;
         }
@@ -84,51 +84,27 @@ internal static class SimpleShopPatches
         _pendingIndex = selectedIndex;
         _pendingUnitCost = cost;
 
-        // Native confirm (ConfirmDialogPatches attaches quantity controls).
-        DialogueYesNoBox.Open(
-            yes: OnSimpleConfirmYes,
-            no: OnSimpleConfirmNo,
-            returnHud: true,
-            text: shopItem.DisplayName,
-            currencyType: shopItem.CurrencyType,
-            currencyAmount: cost,
-            items: null,
-            amounts: null,
-            displayHudPopup: true,
-            consumeCurrency: false,
-            willGetItem: collectable,
-            takeItemType: TakeItemTypes.Silent,
-            displayType: YesNoAction.DisplayType.WillGetItems);
+        QuantityPicker.Instance.Open(
+            title: shopItem.DisplayName,
+            item: shopItem.Item as CollectableItem,
+            unitCost: cost,
+            currency: shopItem.CurrencyType,
+            maxQuantity: maxQty,
+            onConfirm: qty =>
+            {
+                var menu = _pendingMenu;
+                var pendingOwner = _pendingOwner;
+                int index = _pendingIndex;
+                int unitCost = _pendingUnitCost;
+                ClearPending();
+                if (menu != null && pendingOwner != null)
+                {
+                    ApplySimpleShopBulk(menu, pendingOwner, index, unitCost, qty);
+                }
+            },
+            onCancel: ClearPending);
 
         return false;
-    }
-
-    private static void OnSimpleConfirmYes()
-    {
-        var menu = _pendingMenu;
-        var owner = _pendingOwner;
-        int index = _pendingIndex;
-        int unitCost = _pendingUnitCost;
-        ClearPending();
-
-        if (menu == null || owner == null)
-        {
-            return;
-        }
-
-        int qty = PurchaseBatcher.ConsumePendingQuantity();
-        if (qty < 1)
-        {
-            qty = 1;
-        }
-
-        ApplySimpleShopBulk(menu, owner, index, unitCost, qty);
-    }
-
-    private static void OnSimpleConfirmNo()
-    {
-        PurchaseBatcher.ClearPendingQuantity();
-        ClearPending();
     }
 
     private static void ClearPending()
