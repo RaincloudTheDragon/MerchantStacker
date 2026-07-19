@@ -6,8 +6,8 @@ using UnityEngine;
 namespace MerchantStacker.Patches;
 
 /// <summary>
-/// Reliable merchant qty entry: after the shop's own yes/no, open in-pane qty
-/// (never DialogueYesNoBox). Also batches when PendingQuantity &gt; 1.
+/// Merchant purchases: qty is opened when confirm appears (ShopConfirmListPatches).
+/// This patch batches PendingQuantity or blocks duplicate SetShopItemPurchased.
 /// </summary>
 [HarmonyPatch]
 internal static class ShopPurchasePatches
@@ -19,11 +19,21 @@ internal static class ShopPurchasePatches
         return TryIntercept(
             __instance.Target.GetSafe(__instance),
             subItemIndex: 0,
-            setWaiting: v => __instance.IsWaitingBool.Value = v,
-            finish: __instance.Finish,
-            onDone: () =>
+            setWaiting: v =>
             {
-                __instance.IsWaitingBool.Value = false;
+                if (__instance.IsWaitingBool != null)
+                {
+                    __instance.IsWaitingBool.Value = v;
+                }
+            },
+            finish: __instance.Finish,
+            onPurchaseComplete: () =>
+            {
+                if (__instance.IsWaitingBool != null)
+                {
+                    __instance.IsWaitingBool.Value = false;
+                }
+
                 GameCameras.instance?.HUDIn();
             });
     }
@@ -36,11 +46,21 @@ internal static class ShopPurchasePatches
         return TryIntercept(
             __instance.Target.GetSafe(__instance),
             sub,
-            setWaiting: v => __instance.IsWaitingBool.Value = v,
-            finish: __instance.Finish,
-            onDone: () =>
+            setWaiting: v =>
             {
-                __instance.IsWaitingBool.Value = false;
+                if (__instance.IsWaitingBool != null)
+                {
+                    __instance.IsWaitingBool.Value = v;
+                }
+            },
+            finish: __instance.Finish,
+            onPurchaseComplete: () =>
+            {
+                if (__instance.IsWaitingBool != null)
+                {
+                    __instance.IsWaitingBool.Value = false;
+                }
+
                 GameCameras.instance?.HUDIn();
             });
     }
@@ -50,16 +70,33 @@ internal static class ShopPurchasePatches
         int subItemIndex,
         Action<bool> setWaiting,
         Action finish,
-        Action onDone)
+        Action onPurchaseComplete)
     {
         if (!MerchantStackerPlugin.Enabled.Value || PurchaseBatcher.IsBatching)
         {
             return true;
         }
 
+        // Qty UI owns the pad — never let Yes/No purchase fire underneath.
+        if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
+        {
+            MerchantStackerPlugin.Log.LogInfo("SetShopItemPurchased blocked (qty picker open)");
+            setWaiting(false);
+            finish();
+            return false;
+        }
+
+        // Already bulk-bought this confirm — skip until shop resets.
+        if (PurchaseBatcher.BlockShopPurchases)
+        {
+            MerchantStackerPlugin.Log.LogInfo("SetShopItemPurchased blocked (bulk already done)");
+            setWaiting(false);
+            finish();
+            return false;
+        }
+
         if (target == null)
         {
-            MerchantStackerPlugin.Log.LogInfo("SetShopItemPurchased: null target");
             return true;
         }
 
@@ -78,55 +115,38 @@ internal static class ShopPurchasePatches
         if (pending > 1)
         {
             setWaiting(true);
-            PurchaseBatcher.BuyShopItem(stats, pending, subItemIndex, onDone);
+            PurchaseBatcher.BuyShopItem(stats, pending, subItemIndex, onPurchaseComplete);
             finish();
             return false;
         }
 
-        // Bulk item and no qty session yet → open in-pane qty (shop yes/no already accepted).
-        if (Eligibility.IsBulkEligible(stats.Item)
-            && Eligibility.GetMaxQuantity(stats.Item) > 1
-            && QuantityPicker.Instance != null
-            && !QuantityPicker.Instance.IsOpen)
+        // Bulk item reached purchase without qty UI — open qty instead of voiding the buy.
+        if (Eligibility.IsBulkEligible(stats.Item) && Eligibility.GetMaxQuantity(stats.Item) > 1)
         {
-            Transform shopRoot = stats.transform;
-            var stock = stats.GetComponentInParent<ShopMenuStock>();
-            if (stock != null)
-            {
-                shopRoot = stock.transform;
-            }
-            else
-            {
-                foreach (ShopMenuStock s in UnityEngine.Object.FindObjectsByType<ShopMenuStock>(FindObjectsSortMode.None))
-                {
-                    if (s != null && s.isActiveAndEnabled)
-                    {
-                        shopRoot = s.transform;
-                        break;
-                    }
-                }
-            }
-
-            var pane = stats.GetComponentInParent<InventoryPaneBase>();
-            if (pane != null)
-            {
-                shopRoot = pane.transform;
-            }
-
-            MerchantStackerPlugin.Log.LogInfo($"Purchase → in-pane qty: {stats.Item.DisplayName}");
-
             setWaiting(true);
-            finish();
-            QuantityPicker.Instance.SetPurchaseDoneCallback(onDone);
-            QuantityPicker.Instance.OpenInShop(
-                shopRoot: shopRoot,
-                title: stats.Item.DisplayName,
-                item: stats.Item.Item as CollectableItem,
-                unitCost: stats.Item.Cost,
-                currency: stats.Item.CurrencyType,
-                maxQuantity: Eligibility.GetMaxQuantity(stats.Item),
-                stats: stats);
-            return false;
+            if (ShopConfirmListPatches.TryOpenQtyImmediate(stats))
+            {
+                MerchantStackerPlugin.Log.LogInfo(
+                    "SetShopItemPurchased → opened late qty UI (Yes beat confirm hook)");
+                // Keep FSM waiting; qty confirm buys + ResetShopWindow.
+                QuantityPicker.Instance!.ArmShopPurchaseSession(
+                    onPurchaseComplete: onPurchaseComplete,
+                    onCancelPurchase: () =>
+                    {
+                        setWaiting(false);
+                        PurchaseBatcher.EndShopPurchaseBlock();
+                        EventRegister.SendEvent(EventRegisterEvents.ResetShopWindow);
+                        GameCameras.instance?.HUDIn();
+                    });
+                finish();
+                return false;
+            }
+
+            // Last resort: allow a single vanilla purchase rather than doing nothing.
+            MerchantStackerPlugin.Log.LogWarning(
+                "SetShopItemPurchased: qty UI unavailable — allowing single vanilla buy");
+            setWaiting(false);
+            return true;
         }
 
         return true;

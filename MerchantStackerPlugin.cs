@@ -25,6 +25,7 @@ public class MerchantStackerPlugin : BaseUnityPlugin
     internal static ConfigEntry<float> HoldAccel = null!;
 
     private Harmony? _harmony;
+    private GameObject? _pickerGo;
 
     private void Awake()
     {
@@ -38,10 +39,10 @@ public class MerchantStackerPlugin : BaseUnityPlugin
         HoldMinRepeat = Config.Bind("Controls", "HoldMinRepeat", 0.05f, "Fastest hold-repeat interval in seconds.");
         HoldAccel = Config.Bind("Controls", "HoldAccel", 0.85f, "Multiply repeat interval by this each step while held (< 1 accelerates).");
 
-        var pickerGo = new GameObject("MerchantStacker_QuantityPicker");
-        DontDestroyOnLoad(pickerGo);
-        pickerGo.hideFlags = HideFlags.HideAndDontSave;
-        pickerGo.AddComponent<QuantityPicker>();
+        _pickerGo = new GameObject("MerchantStacker_QuantityPicker");
+        DontDestroyOnLoad(_pickerGo);
+        _pickerGo.hideFlags = HideFlags.HideAndDontSave;
+        _pickerGo.AddComponent<QuantityPicker>();
 
         _harmony = new Harmony(PluginGuid);
         TryPatch(typeof(ShopSelectionCachePatches));
@@ -52,7 +53,7 @@ public class MerchantStackerPlugin : BaseUnityPlugin
         TryPatch(typeof(SimpleShopPatches));
         TryPatch(typeof(MachinePurchasePatches));
 
-        Log.LogInfo($"{PluginName} v{PluginVersion} loaded.");
+        Log.LogInfo($"{PluginName} v{PluginVersion} loaded (F6 ScriptEngine reload supported).");
     }
 
     private void TryPatch(System.Type type)
@@ -68,8 +69,46 @@ public class MerchantStackerPlugin : BaseUnityPlugin
         }
     }
 
+    /// <summary>
+    /// ScriptEngine calls this on F6 reload — must unpatch Harmony and destroy loose objects.
+    /// </summary>
     private void OnDestroy()
     {
+        try
+        {
+            QuantityPicker.Instance?.ShutdownForReload();
+        }
+        catch (System.Exception ex)
+        {
+            Log?.LogWarning($"QuantityPicker unload: {ex.Message}");
+        }
+
+        if (_pickerGo != null)
+        {
+            DestroyImmediate(_pickerGo);
+            _pickerGo = null;
+        }
+
+        PurchaseBatcher.ClearPendingQuantity();
+        PurchaseBatcher.ClearShopPurchaseSuppression();
+
+        try
+        {
+            InventoryPaneInput.IsInputBlocked = false;
+        }
+        catch
+        {
+            // Game may already be tearing down.
+        }
+
         _harmony?.UnpatchSelf();
+        _harmony = null;
+
+        if (Instance == this)
+        {
+            Instance = null!;
+        }
+
+        Log?.LogInfo($"{PluginName} unloaded.");
     }
 }

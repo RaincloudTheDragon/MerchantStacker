@@ -71,6 +71,11 @@ internal static class MachinePurchasePatches
             return true;
         }
 
+        if (QuantityPicker.Instance == null)
+        {
+            return true;
+        }
+
         // Open quantity picker (owns pad; native confirm blocks vertical input).
         _waitingForConfirm = true;
         _heldTakeAction = __instance;

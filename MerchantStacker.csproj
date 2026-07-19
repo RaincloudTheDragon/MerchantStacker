@@ -63,11 +63,32 @@
       <ThunderstoreDir>$(ProjectDir)/thunderstore</ThunderstoreDir>
     </PropertyGroup>
 
-    <!-- Local install -->
+    <!-- Local install: BepInEx/plugins (Chainloader). Keep scripts/ clear of this GUID —
+         dual-load with ScriptEngine (F6) fails with "GUID already loaded".
+         Never leave DLLs under a *.disabled folder (BepInEx still loads them). -->
+    <PropertyGroup>
+      <LocalPluginDir>$(SilksongPluginsFolder)/RaincloudTheDragon-$(AssemblyTitle)</LocalPluginDir>
+    </PropertyGroup>
+    <RemoveDir
+      Directories="$(SilksongPluginsFolder)/RaincloudTheDragon-$(AssemblyTitle).disabled"
+      Condition="'$(SilksongPluginsFolder)' != '' And Exists('$(SilksongPluginsFolder)/RaincloudTheDragon-$(AssemblyTitle).disabled')"
+    />
+    <MakeDir
+      Directories="$(LocalPluginDir)"
+      Condition="'$(SilksongPluginsFolder)' != ''"
+    />
+    <!-- ContinueOnError: game locks the DLL while running — quit Silksong to refresh. -->
     <Copy
       SourceFiles="@(Binaries)"
-      DestinationFolder="$(SilksongPluginsFolder)/RaincloudTheDragon-$(AssemblyTitle)/%(Binaries.LocalDir)"
-      Condition="'$(SilksongPluginsFolder)' != '' And Exists('$(SilksongPluginsFolder)')"
+      DestinationFolder="$(LocalPluginDir)/"
+      Condition="'$(SilksongPluginsFolder)' != ''"
+      ContinueOnError="true"
+    />
+    <!-- Remove scripts copy so only plugins loads on boot. -->
+    <Delete
+      Files="$(SilksongScriptsFolder)/$(TargetName).dll;$(SilksongScriptsFolder)/$(TargetName).pdb"
+      Condition="'$(SilksongScriptsFolder)' != ''"
+      ContinueOnError="true"
     />
 
     <!-- Thunderstore packaging -->

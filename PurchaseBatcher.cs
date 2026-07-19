@@ -14,6 +14,12 @@ internal static class PurchaseBatcher
     /// </summary>
     internal static bool IsBatching { get; private set; }
 
+    /// <summary>
+    /// After a MerchantStacker bulk buy, ignore SetShopItemPurchased until the shop
+    /// window resets (prevents second purchase / qty re-open / thank-you A mash).
+    /// </summary>
+    internal static bool BlockShopPurchases { get; private set; }
+
     internal static void ClearPendingQuantity()
     {
         PendingQuantity = 0;
@@ -24,6 +30,21 @@ internal static class PurchaseBatcher
         int qty = PendingQuantity;
         PendingQuantity = 0;
         return qty;
+    }
+
+    internal static void BeginShopPurchaseBlock()
+    {
+        BlockShopPurchases = true;
+    }
+
+    internal static void EndShopPurchaseBlock()
+    {
+        BlockShopPurchases = false;
+    }
+
+    internal static void ClearShopPurchaseSuppression()
+    {
+        BlockShopPurchases = false;
     }
 
     internal static void BuyShopItem(ShopItemStats stats, int quantity, int subItemIndex, Action? onComplete)
@@ -50,6 +71,10 @@ internal static class PurchaseBatcher
             }
 
             MerchantStackerPlugin.Log.LogInfo($"Bought {bought}x {stats.Item.DisplayName}");
+            if (bought > 0)
+            {
+                BeginShopPurchaseBlock();
+            }
         }
         finally
         {
@@ -94,6 +119,10 @@ internal static class PurchaseBatcher
             }
 
             MerchantStackerPlugin.Log.LogInfo($"Bought {bought}x {item.DisplayName}");
+            if (bought > 0)
+            {
+                BeginShopPurchaseBlock();
+            }
         }
         finally
         {

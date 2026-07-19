@@ -15,7 +15,7 @@ namespace MerchantStacker;
 /// </summary>
 internal sealed class QuantityPicker : MonoBehaviour
 {
-    internal static QuantityPicker Instance { get; private set; } = null!;
+    internal static QuantityPicker? Instance { get; private set; }
 
     /// <summary>True while Open() is calling DialogueYesNoBox.Open (do not re-hijack).</summary>
     internal static bool SuppressHijack { get; private set; }
@@ -99,8 +99,6 @@ internal sealed class QuantityPicker : MonoBehaviour
     private GameObject? _hudArrowUp;
     private GameObject? _hudArrowDown;
     private SpriteRenderer? _hudCurrencyIcon;
-    private bool _costIsNative;
-    private string? _nativeMoneyCostOriginal;
     private GameObject? _hiddenConfirmList;
     private GameObject? _hiddenConfirmMsg;
     private readonly List<GameObject> _hiddenNativeCost = new();
@@ -109,6 +107,7 @@ internal sealed class QuantityPicker : MonoBehaviour
     private Action<int>? _onConfirm;
     private Action? _onCancel;
     private Action? _purchaseDone;
+    private Action? _shopCancel;
 
     private float _upTimer;
     private float _downTimer;
@@ -121,6 +120,41 @@ internal sealed class QuantityPicker : MonoBehaviour
     private void Awake()
     {
         Instance = this;
+    }
+
+    /// <summary>
+    /// ScriptEngine / plugin unload: close any open session and drop the static instance.
+    /// </summary>
+    internal void ShutdownForReload()
+    {
+        SuppressHijack = false;
+        try
+        {
+            if (_active)
+            {
+                if (_inShop)
+                {
+                    AbortInShopSession(resetShopWindow: true);
+                }
+                else
+                {
+                    Finish(confirmed: false);
+                }
+            }
+            else
+            {
+                DestroyInShopHud(restoreTexts: true);
+            }
+        }
+        catch (Exception ex)
+        {
+            MerchantStackerPlugin.Log.LogWarning($"QuantityPicker shutdown: {ex.Message}");
+        }
+
+        if (Instance == this)
+        {
+            Instance = null;
+        }
     }
 
     public bool IsOpen => _active;
@@ -158,10 +192,58 @@ internal sealed class QuantityPicker : MonoBehaviour
             $"In-shop qty: {_title} max={_max} cost={_unitCost} hud={(_hudRoot != null)}");
     }
 
-    /// <summary>Optional FSM/HUD cleanup after an in-shop bulk buy finishes or cancels.</summary>
-    public void SetPurchaseDoneCallback(Action? onDone)
+    /// <summary>Wire shop FSM wait/complete + cancel (reset window, no extra purchase).</summary>
+    public void ArmShopPurchaseSession(Action? onPurchaseComplete, Action? onCancelPurchase)
     {
-        _purchaseDone = onDone;
+        _purchaseDone = onPurchaseComplete;
+        _shopCancel = onCancelPurchase;
+    }
+
+    private void LateUpdate()
+    {
+        if (!_active || !_inShop)
+        {
+            return;
+        }
+
+        // Only abort when the whole shop menu is gone.
+        // Do NOT check ShopItemStats.activeInHierarchy — list rows are often disabled
+        // while Item Confirm Group is up (that was aborting qty every frame).
+        Transform? root = _shopRoot != null ? _shopRoot : _shopStats != null ? _shopStats.transform.root : null;
+        if (root == null || !root || !root.gameObject.activeInHierarchy)
+        {
+            AbortInShopSession(resetShopWindow: true);
+        }
+    }
+
+    /// <summary>Force-close qty without purchasing (shop closed or lost).</summary>
+    private void AbortInShopSession(bool resetShopWindow)
+    {
+        if (!_active)
+        {
+            return;
+        }
+
+        MerchantStackerPlugin.Log.LogInfo("In-shop qty aborted (shop closed/disabled)");
+        PurchaseBatcher.ClearPendingQuantity();
+        PurchaseBatcher.ClearShopPurchaseSuppression();
+        var cancel = _shopCancel;
+        _purchaseDone = null;
+        _shopCancel = null;
+        _active = false;
+        _hijacked = false;
+        _inShop = false;
+        _shopRoot = null;
+        _shopStats = null;
+        DestroyInShopHud(restoreTexts: true);
+        ResetHoldState();
+        InventoryPaneInput.IsInputBlocked = false;
+
+        // Clear FSM wait + reset confirm UI so we don't leave a blank pane + stuck cost.
+        if (resetShopWindow)
+        {
+            cancel?.Invoke();
+        }
     }
 
     /// <summary>
@@ -188,6 +270,8 @@ internal sealed class QuantityPicker : MonoBehaviour
         _originalNo = originalNo;
         _onConfirm = null;
         _onCancel = null;
+        _purchaseDone = null;
+        _shopCancel = null;
 
         CurrentYesField.SetValue(box, (Action)(() => Finish(confirmed: true)));
         CurrentNoField.SetValue(box, (Action)(() => Finish(confirmed: false)));
@@ -221,6 +305,8 @@ internal sealed class QuantityPicker : MonoBehaviour
         _onCancel = onCancel;
         _originalYes = null;
         _originalNo = null;
+        _purchaseDone = null;
+        _shopCancel = null;
 
         SuppressHijack = true;
         try
@@ -268,6 +354,7 @@ internal sealed class QuantityPicker : MonoBehaviour
         _inShop = false;
         _shopRoot = null;
         _shopStats = null;
+        // Keep ArmShopPurchaseSession callbacks — OpenInShop is called after Arm.
         _active = true;
         PurchaseBatcher.PendingQuantity = 1;
         ResetHoldState();
@@ -329,51 +416,44 @@ internal sealed class QuantityPicker : MonoBehaviour
                 return;
             }
 
-            Transform hudParent = confirmGroup != null ? confirmGroup : confirm;
-            DumpConfirmGroup(hudParent);
+            Transform layoutParent = confirmGroup != null ? confirmGroup : confirm;
+            DumpConfirmGroup(layoutParent);
             HideConfirmChrome(confirm, confirmGroup);
+            HideNativeConfirmCosts(confirm);
 
-            // Reuse native money row (Geo Sprite + Item cost) — do not clone/hide it.
-            BindNativeMoneyCost(confirm);
-
+            // Parent to this DontDestroyOnLoad picker — never under shop (prevents stuck overlays).
             _hudRoot = new GameObject("MerchantStacker_QtyHud");
-            _hudRoot.layer = hudParent.gameObject.layer;
-            _hudRoot.transform.SetParent(hudParent, false);
+            _hudRoot.layer = layoutParent.gameObject.layer;
+            _hudRoot.transform.SetParent(transform, false);
             _hudRoot.transform.localPosition = Vector3.zero;
             _hudRoot.transform.localRotation = Quaternion.identity;
             _hudRoot.transform.localScale = Vector3.one;
 
-            // Layout in confirm-group local space (same plane as Item Sprite, z≈-3).
-            GetQtyColumnLocal(hudParent, out Vector3 qtyLocal, out Vector3 upLocal, out Vector3 downLocal);
+            GetQtyColumnWorld(layoutParent, out Vector3 qtyWorld, out Vector3 upWorld, out Vector3 downWorld);
+            Vector3 currencyWorld = qtyWorld + layoutParent.TransformVector(new Vector3(1.5f, 0f, 0f));
+            Vector3 costWorld = qtyWorld + layoutParent.TransformVector(new Vector3(2.4f, 0f, 0f));
 
-            // Match native cost font size (~5) rather than Yes (10).
-            float fs = _hudCost != null ? Math.Max(5f, _hudCost.fontSize) : Math.Max(5f, template.fontSize);
-            _hudQty = CloneTmp(template, _hudRoot.transform, "Qty", qtyLocal, "1", fs * 1.35f);
+            TextMeshPro? costTemplate = FindConfirmCostTmp(confirm) ?? template;
+            float fs = Math.Max(5f, costTemplate.fontSize);
 
-            if (_hudCost == null)
+            _hudQty = CloneTmpWorld(template, _hudRoot.transform, "Qty", qtyWorld, "1", fs * 1.35f);
+            _hudCost = CloneTmpWorld(
+                costTemplate, _hudRoot.transform, "TotalCost", costWorld, "0", fs,
+                TextAlignmentOptions.Left);
+
+            var srcCostIcon = CostSpriteField?.GetValue(_shopStats) as SpriteRenderer;
+            if (srcCostIcon != null)
             {
-                // Fallback clone if Money/Item cost missing.
-                Vector3 costLocal = qtyLocal + new Vector3(2.4f, 0f, 0f);
-                _hudCost = CloneTmp(
-                    template, _hudRoot.transform, "TotalCost", costLocal, "0", fs,
-                    TextAlignmentOptions.Left);
-                _costIsNative = false;
-
-                var srcCostIcon = CostSpriteField?.GetValue(_shopStats) as SpriteRenderer;
-                if (srcCostIcon != null)
+                _hudCurrencyIcon = CloneSpriteWorld(
+                    srcCostIcon, _hudRoot.transform, "CurrencyIcon", currencyWorld, scaleMul: 1f);
+                Sprite? currency = _shopStats.GetCurrencySprite();
+                if (currency != null)
                 {
-                    _hudCurrencyIcon = CloneSprite(
-                        srcCostIcon, _hudRoot.transform, "CurrencyIcon",
-                        qtyLocal + new Vector3(1.5f, 0f, 0f), scaleMul: 1f);
-                    Sprite? currency = _shopStats.GetCurrencySprite();
-                    if (currency != null)
-                    {
-                        _hudCurrencyIcon.sprite = currency;
-                    }
+                    _hudCurrencyIcon.sprite = currency;
                 }
             }
 
-            if (TryCreateVerticalArrows(confirm, hudParent, upLocal, downLocal))
+            if (TryCreateVerticalArrowsWorld(confirm, upWorld, downWorld))
             {
                 MerchantStackerPlugin.Log.LogInfo("Qty HUD arrows: vertical (pointer/small)");
             }
@@ -383,7 +463,7 @@ internal sealed class QuantityPicker : MonoBehaviour
             }
 
             MerchantStackerPlugin.Log.LogInfo(
-                $"Qty HUD local qty={qtyLocal} nativeCost={_costIsNative} arrows={(_hudArrowUp != null)}");
+                $"Qty HUD world qty={qtyWorld} arrows={(_hudArrowUp != null)} currency={(_hudCurrencyIcon != null)}");
         }
         catch (Exception ex)
         {
@@ -391,101 +471,74 @@ internal sealed class QuantityPicker : MonoBehaviour
         }
     }
 
-    /// <summary>Use Confirm/Costs/Money/Item cost + Geo Sprite instead of cloning duplicates.</summary>
-    private void BindNativeMoneyCost(Transform confirm)
+    /// <summary>Hide Confirm/Costs so vanilla unit-price TMP is never rewritten to a bulk total.</summary>
+    private void HideNativeConfirmCosts(Transform confirm)
     {
-        _costIsNative = false;
-        _hudCost = null;
-        _hudCurrencyIcon = null;
-
-        Transform? money = null;
+        _hiddenNativeCost.Clear();
         foreach (Transform t in confirm.GetComponentsInChildren<Transform>(true))
         {
-            if (t != null && t.name == "Money" && t.parent != null && t.parent.name == "Costs")
-            {
-                money = t;
-                break;
-            }
-        }
-
-        if (money == null)
-        {
-            return;
-        }
-
-        foreach (TextMeshPro tmp in money.GetComponentsInChildren<TextMeshPro>(true))
-        {
-            if (tmp != null && tmp.gameObject.name == "Item cost")
-            {
-                _hudCost = tmp;
-                _nativeMoneyCostOriginal = tmp.text;
-                _costIsNative = true;
-                tmp.gameObject.SetActive(true);
-                break;
-            }
-        }
-
-        foreach (SpriteRenderer sr in money.GetComponentsInChildren<SpriteRenderer>(true))
-        {
-            if (sr == null)
+            if (t == null || t.name != "Costs")
             {
                 continue;
             }
 
-            // Prefer the Geo Sprite specifically.
-            if (sr.gameObject.name == "Geo Sprite"
-                || (ContainsIgnore(sr.gameObject.name, "geo") && _hudCurrencyIcon == null))
+            if (t.gameObject.activeSelf)
             {
-                _hudCurrencyIcon = sr;
-                sr.enabled = true;
-                sr.gameObject.SetActive(true);
+                t.gameObject.SetActive(false);
+                _hiddenNativeCost.Add(t.gameObject);
             }
-        }
 
-        // Hide material/tool cost row so only rosaries show for money purchases.
-        Transform? costs = money.parent;
-        if (costs != null)
+            break;
+        }
+    }
+
+    private static TextMeshPro? FindConfirmCostTmp(Transform confirm)
+    {
+        foreach (TextMeshPro tmp in confirm.GetComponentsInChildren<TextMeshPro>(true))
         {
-            foreach (Transform child in costs)
+            if (tmp != null && tmp.gameObject.name == "Item cost")
             {
-                if (child != null && child.name != "Money" && child.gameObject.activeSelf)
-                {
-                    child.gameObject.SetActive(false);
-                    _hiddenNativeCost.Add(child.gameObject);
-                }
+                return tmp;
             }
         }
+
+        return null;
     }
 
-    /// <summary>
-    /// Qty column just right of Item Sprite, on the same local Z plane as the confirm art.
-    /// </summary>
-    private static void GetQtyColumnLocal(
-        Transform hudParent,
-        out Vector3 qtyLocal,
-        out Vector3 upLocal,
-        out Vector3 downLocal)
+    /// <summary>World-space qty column just right of the confirm Item Sprite.</summary>
+    private static void GetQtyColumnWorld(
+        Transform layoutParent,
+        out Vector3 qtyWorld,
+        out Vector3 upWorld,
+        out Vector3 downWorld)
     {
-        Transform? item = FindNamedTransform(hudParent, "Item Sprite");
-        Vector3 itemLp = item != null ? item.localPosition : new Vector3(-3.4f, 1.5f, -3f);
-        float z = itemLp.z;
+        Transform? item = FindNamedTransform(layoutParent, "Item Sprite");
+        if (item != null)
+        {
+            Vector3 right = layoutParent.TransformVector(new Vector3(2.55f, 0f, 0f));
+            Vector3 up = layoutParent.TransformVector(new Vector3(0f, 1.05f, 0f));
+            qtyWorld = item.position + right;
+            upWorld = qtyWorld + up;
+            downWorld = qtyWorld - up;
+            return;
+        }
 
-        // Dump: Item Sprite ≈ (-3.44, 1.52, -3); sit clear to its right.
-        qtyLocal = new Vector3(itemLp.x + 2.55f, itemLp.y, z);
-        upLocal = new Vector3(qtyLocal.x, qtyLocal.y + 1.05f, z);
-        downLocal = new Vector3(qtyLocal.x, qtyLocal.y - 1.05f, z);
+        qtyWorld = layoutParent.TransformPoint(new Vector3(-0.89f, 1.52f, -3f));
+        upWorld = layoutParent.TransformPoint(new Vector3(-0.89f, 2.57f, -3f));
+        downWorld = layoutParent.TransformPoint(new Vector3(-0.89f, 0.47f, -3f));
     }
 
-    /// <summary>
-    /// Prefer small menu Pointer carets (rotated to vertical). Avoid Quest-list wide scroll arrows.
-    /// </summary>
-    private bool TryCreateVerticalArrows(
-        Transform confirm,
-        Transform hudParent,
-        Vector3 upLocal,
-        Vector3 downLocal)
+    private bool TryCreateVerticalArrowsWorld(Transform confirm, Vector3 upWorld, Vector3 downWorld)
     {
-        // 1) SimpleShopMenu true up/down animators (when present in scene).
+        Transform? pointer = FindNamedTransform(confirm, "Pointer L");
+        if (pointer != null)
+        {
+            _hudArrowUp = CloneArrowWorld(pointer.gameObject, _hudRoot!.transform, "ArrowUp", upWorld, 90f, 0.75f);
+            _hudArrowDown = CloneArrowWorld(pointer.gameObject, _hudRoot.transform, "ArrowDown", downWorld, -90f, 0.75f);
+            MerchantStackerPlugin.Log.LogInfo("Arrows from Confirm Pointer L (rotated vertical)");
+            return true;
+        }
+
         foreach (SimpleShopMenu menu in Resources.FindObjectsOfTypeAll<SimpleShopMenu>())
         {
             if (menu == null || !menu.gameObject.scene.IsValid())
@@ -500,60 +553,9 @@ internal sealed class QuantityPicker : MonoBehaviour
                 continue;
             }
 
-            _hudArrowUp = CloneArrow(u.gameObject, _hudRoot!.transform, "ArrowUp", upLocal, 0f, 0.85f);
-            _hudArrowDown = CloneArrow(d.gameObject, _hudRoot.transform, "ArrowDown", downLocal, 0f, 0.85f);
+            _hudArrowUp = CloneArrowWorld(u.gameObject, _hudRoot!.transform, "ArrowUp", upWorld, 0f, 0.85f);
+            _hudArrowDown = CloneArrowWorld(d.gameObject, _hudRoot.transform, "ArrowDown", downWorld, 0f, 0.85f);
             MerchantStackerPlugin.Log.LogInfo("Arrows from SimpleShopMenu up/down");
-            return true;
-        }
-
-        // 2) Yes/No Pointer L — small tk2d carets; rotate into vertical.
-        Transform? pointer = FindNamedTransform(confirm, "Pointer L")
-            ?? FindNamedTransform(hudParent, "Pointer L");
-        if (pointer != null)
-        {
-            // Pointer L faces left; ±90° makes up/down.
-            _hudArrowUp = CloneArrow(pointer.gameObject, _hudRoot!.transform, "ArrowUp", upLocal, 90f, 0.75f);
-            _hudArrowDown = CloneArrow(pointer.gameObject, _hudRoot.transform, "ArrowDown", downLocal, -90f, 0.75f);
-            MerchantStackerPlugin.Log.LogInfo("Arrows from Confirm Pointer L (rotated vertical)");
-            return true;
-        }
-
-        // 3) Compact InvAnimateUpAndDown only (reject wide save/quest pan arrows).
-        InvAnimateUpAndDown? smallUp = null;
-        InvAnimateUpAndDown? smallDown = null;
-        foreach (InvAnimateUpAndDown arrow in Resources.FindObjectsOfTypeAll<InvAnimateUpAndDown>())
-        {
-            if (arrow == null || !arrow.gameObject.scene.IsValid() || IsWideArrow(arrow.gameObject))
-            {
-                continue;
-            }
-
-            string path = PathOf(arrow.transform);
-            if (ContainsIgnore(path, "Quest") || ContainsIgnore(path, "Map") || ContainsIgnore(path, "Pan"))
-            {
-                continue;
-            }
-
-            string n = arrow.gameObject.name;
-            if (ContainsIgnore(n, "up") || n.EndsWith("U", StringComparison.Ordinal))
-            {
-                smallUp ??= arrow;
-            }
-            else if (ContainsIgnore(n, "down") || n.EndsWith("D", StringComparison.Ordinal))
-            {
-                smallDown ??= arrow;
-            }
-        }
-
-        if (smallUp != null)
-        {
-            GameObject downSrc = smallDown != null ? smallDown.gameObject : smallUp.gameObject;
-            _hudArrowUp = CloneArrow(smallUp.gameObject, _hudRoot!.transform, "ArrowUp", upLocal, 0f, 0.85f);
-            _hudArrowDown = CloneArrow(
-                downSrc, _hudRoot.transform, "ArrowDown", downLocal,
-                ReferenceEquals(downSrc, smallUp.gameObject) ? 180f : 0f,
-                0.85f);
-            MerchantStackerPlugin.Log.LogInfo($"Arrows from compact InvAnimate '{smallUp.name}'");
             return true;
         }
 
@@ -578,19 +580,19 @@ internal sealed class QuantityPicker : MonoBehaviour
         return false;
     }
 
-    private static GameObject CloneArrow(
+    private static GameObject CloneArrowWorld(
         GameObject template,
         Transform parent,
         string name,
-        Vector3 localPos,
+        Vector3 worldPos,
         float rotationZ,
         float scale)
     {
         var go = UnityEngine.Object.Instantiate(template, parent);
         go.name = name;
         go.SetActive(true);
-        go.transform.localPosition = localPos;
-        go.transform.localRotation = Quaternion.Euler(0f, 0f, rotationZ);
+        go.transform.position = worldPos;
+        go.transform.rotation = Quaternion.Euler(0f, 0f, rotationZ);
         go.transform.localScale = Vector3.one * scale;
 
         go.GetComponent<InvAnimateUpAndDown>()?.Show();
@@ -801,11 +803,11 @@ internal sealed class QuantityPicker : MonoBehaviour
         tmp.color = c;
     }
 
-    private static TextMeshPro CloneTmp(
+    private static TextMeshPro CloneTmpWorld(
         TextMeshPro template,
         Transform parent,
         string name,
-        Vector3 localPos,
+        Vector3 worldPos,
         string text,
         float fontSize,
         TextAlignmentOptions alignment = TextAlignmentOptions.Center)
@@ -813,11 +815,10 @@ internal sealed class QuantityPicker : MonoBehaviour
         var go = UnityEngine.Object.Instantiate(template.gameObject, parent);
         go.name = name;
         go.SetActive(true);
-        go.transform.localPosition = localPos;
-        go.transform.localRotation = Quaternion.identity;
+        go.transform.position = worldPos;
+        go.transform.rotation = Quaternion.identity;
         go.transform.localScale = Vector3.one;
 
-        // Drop any chrome that came along with Yes/Text (frames, fades, etc.).
         for (int i = go.transform.childCount - 1; i >= 0; i--)
         {
             UnityEngine.Object.Destroy(go.transform.GetChild(i).gameObject);
@@ -844,18 +845,18 @@ internal sealed class QuantityPicker : MonoBehaviour
         return tmp;
     }
 
-    private static SpriteRenderer CloneSprite(
+    private static SpriteRenderer CloneSpriteWorld(
         SpriteRenderer template,
         Transform parent,
         string name,
-        Vector3 localPos,
+        Vector3 worldPos,
         float scaleMul)
     {
         var go = UnityEngine.Object.Instantiate(template.gameObject, parent);
         go.name = name;
         go.SetActive(true);
-        go.transform.localPosition = localPos;
-        go.transform.localRotation = Quaternion.identity;
+        go.transform.position = worldPos;
+        go.transform.rotation = Quaternion.identity;
         go.transform.localScale = template.transform.localScale * scaleMul;
 
         var sr = go.GetComponent<SpriteRenderer>();
@@ -904,7 +905,7 @@ internal sealed class QuantityPicker : MonoBehaviour
         return null;
     }
 
-    private void DestroyInShopHud(bool restoreTexts)
+    private void DestroyInShopHud(bool restoreTexts, bool restoreConfirmChrome = true)
     {
         if (restoreTexts)
         {
@@ -917,38 +918,15 @@ internal sealed class QuantityPicker : MonoBehaviour
             {
                 ApplyTmp(_boundCostText, _originalCostText);
             }
-
-            if (_costIsNative && _hudCost != null && _nativeMoneyCostOriginal != null)
-            {
-                ApplyTmp(_hudCost, _nativeMoneyCostOriginal);
-            }
         }
 
-        if (_hiddenConfirmList != null)
-        {
-            _hiddenConfirmList.SetActive(true);
-            _hiddenConfirmList = null;
-        }
-
-        if (_hiddenConfirmMsg != null)
-        {
-            _hiddenConfirmMsg.SetActive(true);
-            _hiddenConfirmMsg = null;
-        }
-
-        foreach (GameObject go in _hiddenNativeCost)
-        {
-            if (go != null)
-            {
-                go.SetActive(true);
-            }
-        }
-
-        _hiddenNativeCost.Clear();
+        // Wipe our TMP meshes before destroy so world-space digits can't linger.
+        ClearTmpVisual(_hudQty);
+        ClearTmpVisual(_hudCost);
 
         if (_hudRoot != null)
         {
-            UnityEngine.Object.Destroy(_hudRoot);
+            UnityEngine.Object.DestroyImmediate(_hudRoot);
         }
 
         _hudRoot = null;
@@ -957,8 +935,50 @@ internal sealed class QuantityPicker : MonoBehaviour
         _hudArrowDown = null;
         _hudCost = null;
         _hudCurrencyIcon = null;
-        _costIsNative = false;
-        _nativeMoneyCostOriginal = null;
+        ScrubLeftoverQtyHud();
+
+        if (restoreConfirmChrome)
+        {
+            if (_hiddenConfirmList != null)
+            {
+                _hiddenConfirmList.SetActive(true);
+                _hiddenConfirmList = null;
+            }
+
+            if (_hiddenConfirmMsg != null)
+            {
+                _hiddenConfirmMsg.SetActive(true);
+                _hiddenConfirmMsg = null;
+            }
+
+            foreach (GameObject go in _hiddenNativeCost)
+            {
+                if (go == null)
+                {
+                    continue;
+                }
+
+                // Ensure native unit price is restored (never leave a bulk total on Item cost).
+                foreach (TextMeshPro tmp in go.GetComponentsInChildren<TextMeshPro>(true))
+                {
+                    if (tmp != null && tmp.gameObject.name == "Item cost" && _unitCost > 0)
+                    {
+                        ApplyTmp(tmp, _unitCost.ToString(CultureInfo.InvariantCulture));
+                    }
+                }
+
+                go.SetActive(true);
+            }
+
+            _hiddenNativeCost.Clear();
+        }
+        else
+        {
+            // Success path: chrome stays hidden for the FSM thank-you transition.
+            _hiddenConfirmList = null;
+            _hiddenConfirmMsg = null;
+            _hiddenNativeCost.Clear();
+        }
 
         if (restoreTexts)
         {
@@ -966,6 +986,64 @@ internal sealed class QuantityPicker : MonoBehaviour
             _originalShopTitle = null;
             _boundCostText = null;
             _originalCostText = null;
+        }
+    }
+
+    private static void ClearTmpVisual(TextMeshPro? tmp)
+    {
+        if (tmp == null)
+        {
+            return;
+        }
+
+        try
+        {
+            tmp.SetText(string.Empty);
+            tmp.ForceMeshUpdate(true);
+            var mr = tmp.GetComponent<MeshRenderer>();
+            if (mr != null)
+            {
+                mr.enabled = false;
+            }
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+
+    /// <summary>Destroy any leftover qty HUD objects and disable stray TotalCost meshes.</summary>
+    private static void ScrubLeftoverQtyHud()
+    {
+        foreach (GameObject go in Resources.FindObjectsOfTypeAll<GameObject>())
+        {
+            if (go == null || !go.scene.IsValid())
+            {
+                continue;
+            }
+
+            if (go.name == "MerchantStacker_QtyHud"
+                || go.name == "TotalCost"
+                || go.name == "Qty"
+                || go.name == "ArrowUp"
+                || go.name == "ArrowDown"
+                || go.name == "CurrencyIcon")
+            {
+                // Only ours: must be under a MerchantStacker root or named HUD.
+                bool ours = go.name == "MerchantStacker_QtyHud"
+                    || (go.transform.parent != null && go.transform.parent.name == "MerchantStacker_QtyHud");
+                if (!ours)
+                {
+                    continue;
+                }
+
+                foreach (TextMeshPro tmp in go.GetComponentsInChildren<TextMeshPro>(true))
+                {
+                    ClearTmpVisual(tmp);
+                }
+
+                UnityEngine.Object.DestroyImmediate(go);
+            }
         }
     }
 
@@ -1009,6 +1087,7 @@ internal sealed class QuantityPicker : MonoBehaviour
         var onCancel = _onCancel;
         var shopStats = _shopStats;
         var purchaseDone = _purchaseDone;
+        var shopCancel = _shopCancel;
 
         _active = false;
         _hijacked = false;
@@ -1020,8 +1099,11 @@ internal sealed class QuantityPicker : MonoBehaviour
         _onConfirm = null;
         _onCancel = null;
         _purchaseDone = null;
+        _shopCancel = null;
         _item = null;
-        DestroyInShopHud(restoreTexts: true);
+
+        // Always destroy our HUD; chrome under confirm is discarded via ResetShopWindow.
+        DestroyInShopHud(restoreTexts: true, restoreConfirmChrome: !(inShop && confirmed));
         ResetHoldState();
         InventoryPaneInput.IsInputBlocked = false;
 
@@ -1039,7 +1121,6 @@ internal sealed class QuantityPicker : MonoBehaviour
         {
             if (confirmed && shopStats != null)
             {
-                // Buy directly — shop FSM confirm already advanced past yes/no.
                 PurchaseBatcher.ClearPendingQuantity();
                 var stock = shopStats.GetComponentInParent<ShopMenuStock>();
                 PurchaseBatcher.BuyShopItem(
@@ -1050,11 +1131,16 @@ internal sealed class QuantityPicker : MonoBehaviour
                     {
                         stock?.SetWasItemPurchased(true);
                         purchaseDone?.Invoke();
+                        ScrubLeftoverQtyHud();
+                        // Straight back to item list — no thank-you / blank confirm.
+                        EventRegister.SendEvent(EventRegisterEvents.ResetShopWindow);
+                        GameCameras.instance?.HUDIn();
+                        MerchantStackerPlugin.Log.LogInfo("Bulk buy done → ResetShopWindow");
                     });
             }
             else
             {
-                purchaseDone?.Invoke();
+                shopCancel?.Invoke();
             }
 
             return;

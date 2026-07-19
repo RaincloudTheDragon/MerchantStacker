@@ -35,7 +35,10 @@ internal static class SimpleShopPatches
     [HarmonyPatch(typeof(SimpleShopMenu), "OnSubmitPressed")]
     private static bool OnSubmitPressedPrefix(SimpleShopMenu __instance)
     {
-        if (!MerchantStackerPlugin.Enabled.Value || _handlingBulk || QuantityPicker.Instance.IsOpen)
+        if (!MerchantStackerPlugin.Enabled.Value
+            || _handlingBulk
+            || QuantityPicker.Instance == null
+            || QuantityPicker.Instance.IsOpen)
         {
             return true;
         }
