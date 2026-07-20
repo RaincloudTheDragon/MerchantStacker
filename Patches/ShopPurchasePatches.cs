@@ -132,7 +132,7 @@ internal static class ShopPurchasePatches
             return false;
         }
 
-        // Bulk item reached purchase without qty UI — open qty instead of voiding the buy.
+        // Bulk item reached purchase without qty UI — open qty; buy path will ResetShopWindow.
         if (Eligibility.IsBulkEligible(stats.Item) && Eligibility.GetMaxQuantity(stats.Item) > 1)
         {
             setWaiting(true);
@@ -140,7 +140,6 @@ internal static class ShopPurchasePatches
             {
                 MerchantStackerPlugin.Log.LogInfo(
                     "SetShopItemPurchased → opened late qty UI (Yes beat confirm hook)");
-                // Keep FSM waiting; qty confirm buys then clears wait → get-item anim.
                 QuantityPicker.Instance!.ArmShopPurchaseSession(
                     onPurchaseComplete: onPurchaseComplete,
                     onCancelPurchase: () =>
@@ -154,7 +153,6 @@ internal static class ShopPurchasePatches
                 return false;
             }
 
-            // Last resort: allow a single vanilla purchase rather than doing nothing.
             MerchantStackerPlugin.Log.LogWarning(
                 "SetShopItemPurchased: qty UI unavailable — allowing single vanilla buy");
             setWaiting(false);

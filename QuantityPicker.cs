@@ -1018,7 +1018,23 @@ internal sealed class QuantityPicker : MonoBehaviour
     {
         foreach (GameObject go in Resources.FindObjectsOfTypeAll<GameObject>())
         {
-            if (go == null || !go.scene.IsValid())
+            if (go == null)
+            {
+                continue;
+            }
+
+            // DontDestroyOnLoad HUD may report an invalid scene — still scrub by name/parent.
+            bool sceneOk;
+            try
+            {
+                sceneOk = go.scene.IsValid() || go.hideFlags != HideFlags.None;
+            }
+            catch
+            {
+                continue;
+            }
+
+            if (!sceneOk && go.name != "MerchantStacker_QtyHud")
             {
                 continue;
             }
@@ -1030,9 +1046,10 @@ internal sealed class QuantityPicker : MonoBehaviour
                 || go.name == "ArrowDown"
                 || go.name == "CurrencyIcon")
             {
-                // Only ours: must be under a MerchantStacker root or named HUD.
                 bool ours = go.name == "MerchantStacker_QtyHud"
-                    || (go.transform.parent != null && go.transform.parent.name == "MerchantStacker_QtyHud");
+                    || (go.transform.parent != null
+                        && (go.transform.parent.name == "MerchantStacker_QtyHud"
+                            || go.transform.parent.name == "MerchantStacker_QuantityPicker"));
                 if (!ours)
                 {
                     continue;
@@ -1046,6 +1063,33 @@ internal sealed class QuantityPicker : MonoBehaviour
                 UnityEngine.Object.DestroyImmediate(go);
             }
         }
+    }
+
+    /// <summary>Nuke any leftover world-space clones parented to the picker.</summary>
+    private void ClearPickerHudChildren()
+    {
+        for (int i = transform.childCount - 1; i >= 0; i--)
+        {
+            Transform child = transform.GetChild(i);
+            if (child == null)
+            {
+                continue;
+            }
+
+            foreach (TextMeshPro tmp in child.GetComponentsInChildren<TextMeshPro>(true))
+            {
+                ClearTmpVisual(tmp);
+            }
+
+            UnityEngine.Object.DestroyImmediate(child.gameObject);
+        }
+
+        _hudRoot = null;
+        _hudQty = null;
+        _hudArrowUp = null;
+        _hudArrowDown = null;
+        _hudCost = null;
+        _hudCurrencyIcon = null;
     }
 
     private static string PathOf(Transform t)
@@ -1073,45 +1117,15 @@ internal sealed class QuantityPicker : MonoBehaviour
     }
 
     /// <summary>
-    /// Prefer letting the shop FSM run SetShopItemPurchased → get-item anim.
-    /// Fall back to a direct buy + CollectableUIMsg if Yes cannot be submitted.
+    /// Buy, show get-item popup, then ResetShopWindow.
+    /// Do not leave the shop FSM on a half-hidden confirm (that softlocked A/B).
     /// </summary>
     private static void CompleteInShopPurchase(ShopItemStats shopStats, int qty, Action? purchaseDone)
     {
         var stock = shopStats.GetComponentInParent<ShopMenuStock>();
-
-        // Late-open path: FSM is already inside SetShopItemPurchased waiting on us.
-        if (purchaseDone != null)
-        {
-            PurchaseBatcher.ClearPendingQuantity();
-            PurchaseBatcher.BuyShopItem(
-                shopStats,
-                qty,
-                subItemIndex: 0,
-                onComplete: () =>
-                {
-                    stock?.SetWasItemPurchased(true);
-                    ShowPurchaseFeedback(shopStats);
-                    ScrubLeftoverQtyHud();
-                    purchaseDone.Invoke();
-                    MerchantStackerPlugin.Log.LogInfo("Bulk buy done → FSM wait cleared (purchase anim)");
-                });
-            return;
-        }
-
-        // Early qty path: keep PendingQuantity and Submit Yes so the FSM purchases
-        // through SetShopItemPurchased and continues into CreateUIMsgGetItem.
-        PurchaseBatcher.PendingQuantity = qty;
-        PurchaseBatcher.ExpectingFsmPurchase = true;
-        ScrubLeftoverQtyHud();
-        if (TrySubmitConfirmYes(shopStats))
-        {
-            MerchantStackerPlugin.Log.LogInfo("Bulk buy → Submit Yes (vanilla purchase anim)");
-            return;
-        }
-
-        PurchaseBatcher.ExpectingFsmPurchase = false;
         PurchaseBatcher.ClearPendingQuantity();
+        PurchaseBatcher.ExpectingFsmPurchase = false;
+
         PurchaseBatcher.BuyShopItem(
             shopStats,
             qty,
@@ -1121,9 +1135,11 @@ internal sealed class QuantityPicker : MonoBehaviour
                 stock?.SetWasItemPurchased(true);
                 ShowPurchaseFeedback(shopStats);
                 ScrubLeftoverQtyHud();
+                // Clear any SetShopItemPurchased wait, then hard-reset to the item list.
+                purchaseDone?.Invoke();
                 EventRegister.SendEvent(EventRegisterEvents.ResetShopWindow);
                 GameCameras.instance?.HUDIn();
-                MerchantStackerPlugin.Log.LogInfo("Bulk buy done → fallback ResetShopWindow + popup");
+                MerchantStackerPlugin.Log.LogInfo("Bulk buy done → popup + ResetShopWindow");
             });
     }
 
@@ -1143,66 +1159,6 @@ internal sealed class QuantityPicker : MonoBehaviour
         catch (Exception ex)
         {
             MerchantStackerPlugin.Log.LogWarning($"ShowPurchaseFeedback: {ex.Message}");
-        }
-    }
-
-    /// <summary>Re-enable confirm Yes and invoke Submit so the shop FSM advances.</summary>
-    private static bool TrySubmitConfirmYes(ShopItemStats stats)
-    {
-        try
-        {
-            Transform root = stats.transform.root;
-            Transform? confirm = FindNamedTransform(root, "Confirm");
-            if (confirm == null)
-            {
-                return false;
-            }
-
-            Transform? uiList = confirm.Find("UI List") ?? FindNamedTransform(confirm, "UI List");
-            if (uiList != null && !uiList.gameObject.activeSelf)
-            {
-                uiList.gameObject.SetActive(true);
-            }
-
-            var list = uiList != null
-                ? uiList.GetComponent<UISelectionList>()
-                : confirm.GetComponentInChildren<UISelectionList>(true);
-            if (list != null)
-            {
-                list.gameObject.SetActive(true);
-                list.SetActive(true);
-            }
-
-            UISelectionListItem? yes = null;
-            foreach (UISelectionListItem item in confirm.GetComponentsInChildren<UISelectionListItem>(true))
-            {
-                if (item == null)
-                {
-                    continue;
-                }
-
-                string n = item.gameObject.name;
-                if (n.Equals("Yes", StringComparison.OrdinalIgnoreCase)
-                    || ContainsIgnore(n, "yes"))
-                {
-                    yes = item;
-                    break;
-                }
-            }
-
-            if (yes == null)
-            {
-                return false;
-            }
-
-            yes.gameObject.SetActive(true);
-            yes.Submit();
-            return true;
-        }
-        catch (Exception ex)
-        {
-            MerchantStackerPlugin.Log.LogWarning($"TrySubmitConfirmYes: {ex.Message}");
-            return false;
         }
     }
 
@@ -1237,9 +1193,9 @@ internal sealed class QuantityPicker : MonoBehaviour
         _shopCancel = null;
         _item = null;
 
-        // Destroy qty HUD. Restore Yes/No when confirming so we can Submit Yes and let
-        // the shop FSM play the vanilla get-item animation.
-        DestroyInShopHud(restoreTexts: true, restoreConfirmChrome: inShop && confirmed);
+        // Never restore Yes/No/Costs on cancel — that left unit-price overlays after ResetShopWindow.
+        DestroyInShopHud(restoreTexts: true, restoreConfirmChrome: false);
+        ClearPickerHudChildren();
         ResetHoldState();
         InventoryPaneInput.IsInputBlocked = false;
 
@@ -1262,7 +1218,12 @@ internal sealed class QuantityPicker : MonoBehaviour
             }
             else
             {
+                ScrubLeftoverQtyHud();
+                ClearPickerHudChildren();
                 shopCancel?.Invoke();
+                ScrubLeftoverQtyHud();
+                ClearPickerHudChildren();
+                MerchantStackerPlugin.Log.LogInfo("Qty cancelled → ResetShopWindow");
             }
 
             return;
