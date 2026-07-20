@@ -90,6 +90,7 @@ public class MerchantStackerPlugin : BaseUnityPlugin
         }
 
         PurchaseBatcher.ClearPendingQuantity();
+        PurchaseBatcher.ExpectingFsmPurchase = false;
         PurchaseBatcher.ClearShopPurchaseSuppression();
 
         try

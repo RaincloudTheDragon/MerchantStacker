@@ -226,6 +226,7 @@ internal sealed class QuantityPicker : MonoBehaviour
 
         MerchantStackerPlugin.Log.LogInfo("In-shop qty aborted (shop closed/disabled)");
         PurchaseBatcher.ClearPendingQuantity();
+        PurchaseBatcher.ExpectingFsmPurchase = false;
         PurchaseBatcher.ClearShopPurchaseSuppression();
         var cancel = _shopCancel;
         _purchaseDone = null;
@@ -1071,6 +1072,140 @@ internal sealed class QuantityPicker : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Prefer letting the shop FSM run SetShopItemPurchased → get-item anim.
+    /// Fall back to a direct buy + CollectableUIMsg if Yes cannot be submitted.
+    /// </summary>
+    private static void CompleteInShopPurchase(ShopItemStats shopStats, int qty, Action? purchaseDone)
+    {
+        var stock = shopStats.GetComponentInParent<ShopMenuStock>();
+
+        // Late-open path: FSM is already inside SetShopItemPurchased waiting on us.
+        if (purchaseDone != null)
+        {
+            PurchaseBatcher.ClearPendingQuantity();
+            PurchaseBatcher.BuyShopItem(
+                shopStats,
+                qty,
+                subItemIndex: 0,
+                onComplete: () =>
+                {
+                    stock?.SetWasItemPurchased(true);
+                    ShowPurchaseFeedback(shopStats);
+                    ScrubLeftoverQtyHud();
+                    purchaseDone.Invoke();
+                    MerchantStackerPlugin.Log.LogInfo("Bulk buy done → FSM wait cleared (purchase anim)");
+                });
+            return;
+        }
+
+        // Early qty path: keep PendingQuantity and Submit Yes so the FSM purchases
+        // through SetShopItemPurchased and continues into CreateUIMsgGetItem.
+        PurchaseBatcher.PendingQuantity = qty;
+        PurchaseBatcher.ExpectingFsmPurchase = true;
+        ScrubLeftoverQtyHud();
+        if (TrySubmitConfirmYes(shopStats))
+        {
+            MerchantStackerPlugin.Log.LogInfo("Bulk buy → Submit Yes (vanilla purchase anim)");
+            return;
+        }
+
+        PurchaseBatcher.ExpectingFsmPurchase = false;
+        PurchaseBatcher.ClearPendingQuantity();
+        PurchaseBatcher.BuyShopItem(
+            shopStats,
+            qty,
+            subItemIndex: 0,
+            onComplete: () =>
+            {
+                stock?.SetWasItemPurchased(true);
+                ShowPurchaseFeedback(shopStats);
+                ScrubLeftoverQtyHud();
+                EventRegister.SendEvent(EventRegisterEvents.ResetShopWindow);
+                GameCameras.instance?.HUDIn();
+                MerchantStackerPlugin.Log.LogInfo("Bulk buy done → fallback ResetShopWindow + popup");
+            });
+    }
+
+    /// <summary>Spawn the collectable get popup / hero reaction (shop SetPurchased uses showPopup:false).</summary>
+    internal static void ShowPurchaseFeedback(ShopItemStats? stats)
+    {
+        try
+        {
+            if (stats?.Item?.Item is not CollectableItem item)
+            {
+                return;
+            }
+
+            CollectableUIMsg.Spawn(item);
+            CollectableItemHeroReaction.DoReaction();
+        }
+        catch (Exception ex)
+        {
+            MerchantStackerPlugin.Log.LogWarning($"ShowPurchaseFeedback: {ex.Message}");
+        }
+    }
+
+    /// <summary>Re-enable confirm Yes and invoke Submit so the shop FSM advances.</summary>
+    private static bool TrySubmitConfirmYes(ShopItemStats stats)
+    {
+        try
+        {
+            Transform root = stats.transform.root;
+            Transform? confirm = FindNamedTransform(root, "Confirm");
+            if (confirm == null)
+            {
+                return false;
+            }
+
+            Transform? uiList = confirm.Find("UI List") ?? FindNamedTransform(confirm, "UI List");
+            if (uiList != null && !uiList.gameObject.activeSelf)
+            {
+                uiList.gameObject.SetActive(true);
+            }
+
+            var list = uiList != null
+                ? uiList.GetComponent<UISelectionList>()
+                : confirm.GetComponentInChildren<UISelectionList>(true);
+            if (list != null)
+            {
+                list.gameObject.SetActive(true);
+                list.SetActive(true);
+            }
+
+            UISelectionListItem? yes = null;
+            foreach (UISelectionListItem item in confirm.GetComponentsInChildren<UISelectionListItem>(true))
+            {
+                if (item == null)
+                {
+                    continue;
+                }
+
+                string n = item.gameObject.name;
+                if (n.Equals("Yes", StringComparison.OrdinalIgnoreCase)
+                    || ContainsIgnore(n, "yes"))
+                {
+                    yes = item;
+                    break;
+                }
+            }
+
+            if (yes == null)
+            {
+                return false;
+            }
+
+            yes.gameObject.SetActive(true);
+            yes.Submit();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            MerchantStackerPlugin.Log.LogWarning($"TrySubmitConfirmYes: {ex.Message}");
+            return false;
+        }
+    }
+
     private void Finish(bool confirmed)
     {
         if (!_active)
@@ -1102,8 +1237,9 @@ internal sealed class QuantityPicker : MonoBehaviour
         _shopCancel = null;
         _item = null;
 
-        // Always destroy our HUD; chrome under confirm is discarded via ResetShopWindow.
-        DestroyInShopHud(restoreTexts: true, restoreConfirmChrome: !(inShop && confirmed));
+        // Destroy qty HUD. Restore Yes/No when confirming so we can Submit Yes and let
+        // the shop FSM play the vanilla get-item animation.
+        DestroyInShopHud(restoreTexts: true, restoreConfirmChrome: inShop && confirmed);
         ResetHoldState();
         InventoryPaneInput.IsInputBlocked = false;
 
@@ -1115,28 +1251,14 @@ internal sealed class QuantityPicker : MonoBehaviour
         else
         {
             PurchaseBatcher.ClearPendingQuantity();
+            PurchaseBatcher.ExpectingFsmPurchase = false;
         }
 
         if (inShop)
         {
             if (confirmed && shopStats != null)
             {
-                PurchaseBatcher.ClearPendingQuantity();
-                var stock = shopStats.GetComponentInParent<ShopMenuStock>();
-                PurchaseBatcher.BuyShopItem(
-                    shopStats,
-                    qty,
-                    subItemIndex: 0,
-                    onComplete: () =>
-                    {
-                        stock?.SetWasItemPurchased(true);
-                        purchaseDone?.Invoke();
-                        ScrubLeftoverQtyHud();
-                        // Straight back to item list — no thank-you / blank confirm.
-                        EventRegister.SendEvent(EventRegisterEvents.ResetShopWindow);
-                        GameCameras.instance?.HUDIn();
-                        MerchantStackerPlugin.Log.LogInfo("Bulk buy done → ResetShopWindow");
-                    });
+                CompleteInShopPurchase(shopStats, qty, purchaseDone);
             }
             else
             {

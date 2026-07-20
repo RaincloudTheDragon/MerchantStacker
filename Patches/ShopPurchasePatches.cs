@@ -111,11 +111,23 @@ internal static class ShopPurchasePatches
 
         ShopSelectionCache.Remember(stats);
 
+        PurchaseBatcher.ExpectingFsmPurchase = false;
+
         int pending = PurchaseBatcher.ConsumePendingQuantity();
-        if (pending > 1)
+        // Qty UI sets pending >= 1, then Submits Yes so the FSM reaches here and can
+        // continue into the vanilla get-item / thank-you animation after we clear wait.
+        if (pending >= 1)
         {
             setWaiting(true);
-            PurchaseBatcher.BuyShopItem(stats, pending, subItemIndex, onPurchaseComplete);
+            PurchaseBatcher.BuyShopItem(
+                stats,
+                pending,
+                subItemIndex,
+                onComplete: () =>
+                {
+                    QuantityPicker.ShowPurchaseFeedback(stats);
+                    onPurchaseComplete();
+                });
             finish();
             return false;
         }
@@ -128,7 +140,7 @@ internal static class ShopPurchasePatches
             {
                 MerchantStackerPlugin.Log.LogInfo(
                     "SetShopItemPurchased → opened late qty UI (Yes beat confirm hook)");
-                // Keep FSM waiting; qty confirm buys + ResetShopWindow.
+                // Keep FSM waiting; qty confirm buys then clears wait → get-item anim.
                 QuantityPicker.Instance!.ArmShopPurchaseSession(
                     onPurchaseComplete: onPurchaseComplete,
                     onCancelPurchase: () =>

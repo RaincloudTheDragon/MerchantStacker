@@ -20,6 +20,12 @@ internal static class PurchaseBatcher
     /// </summary>
     internal static bool BlockShopPurchases { get; private set; }
 
+    /// <summary>
+    /// Qty confirmed and we are about to Submit Yes so the shop FSM can play the
+    /// get-item animation — do not re-open the qty UI on that confirm event.
+    /// </summary>
+    internal static bool ExpectingFsmPurchase { get; set; }
+
     internal static void ClearPendingQuantity()
     {
         PendingQuantity = 0;

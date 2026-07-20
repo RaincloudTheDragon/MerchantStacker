@@ -43,6 +43,7 @@ internal static class ShopConfirmListPatches
         if (!MerchantStackerPlugin.Enabled.Value
             || PurchaseBatcher.IsBatching
             || PurchaseBatcher.BlockShopPurchases
+            || PurchaseBatcher.ExpectingFsmPurchase
             || QuantityPicker.Instance == null
             || QuantityPicker.Instance.IsOpen
             || _pendingQtyOpen)
@@ -57,6 +58,19 @@ internal static class ShopConfirmListPatches
         }
 
         _pollCooldown = 0.1f;
+
+        // Only poll once Item Confirm Group is actually up (avoids false opens).
+        ShopItemStats? stats = ShopSelectionCache.ResolveStats() ?? FindHighlightedBulk();
+        if (stats?.Item == null)
+        {
+            return;
+        }
+
+        if (FindActiveConfirmGroup(stats.transform.root) == null)
+        {
+            return;
+        }
+
         TryOpenQtyFromVisibleConfirm(eventSource: null, reason: "poll");
     }
 
@@ -92,6 +106,7 @@ internal static class ShopConfirmListPatches
         if (!MerchantStackerPlugin.Enabled.Value
             || PurchaseBatcher.IsBatching
             || PurchaseBatcher.BlockShopPurchases
+            || PurchaseBatcher.ExpectingFsmPurchase
             || QuantityPicker.Instance == null
             || QuantityPicker.Instance.IsOpen)
         {
@@ -109,6 +124,7 @@ internal static class ShopConfirmListPatches
     internal static bool TryOpenQtyFromVisibleConfirm(GameObject? eventSource, string reason)
     {
         if (_pendingQtyOpen
+            || PurchaseBatcher.ExpectingFsmPurchase
             || QuantityPicker.Instance == null
             || QuantityPicker.Instance.IsOpen)
         {
@@ -137,13 +153,35 @@ internal static class ShopConfirmListPatches
             return false;
         }
 
-        // Prefer opening once Item Confirm Group is up; otherwise wait a few frames.
+        // Hide Yes/No immediately so the vanilla "Purchase item?" chrome never sticks around.
+        PreHideConfirmChrome(stats.transform.root);
         ShopSelectionCache.Remember(stats);
         _pendingQtyOpen = true;
         QuantityPicker.Instance.StartCoroutine(OpenQtyAfterConfirmShows(stock, stats, reason));
         MerchantStackerPlugin.Log.LogInfo(
             $"Confirm → schedule qty replace: {stats.Item.DisplayName} (via '{reason}')");
         return true;
+    }
+
+    /// <summary>Disable Confirm/UI List + Confirm msg as soon as we know qty will replace them.</summary>
+    private static void PreHideConfirmChrome(Transform root)
+    {
+        foreach (Transform t in root.GetComponentsInChildren<Transform>(true))
+        {
+            if (t == null)
+            {
+                continue;
+            }
+
+            if (t.name == "UI List" && t.parent != null && t.parent.name == "Confirm" && t.gameObject.activeSelf)
+            {
+                t.gameObject.SetActive(false);
+            }
+            else if (t.name == "Confirm msg" && t.gameObject.activeSelf)
+            {
+                t.gameObject.SetActive(false);
+            }
+        }
     }
 
     /// <summary>
