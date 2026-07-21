@@ -627,9 +627,9 @@ internal sealed class QuantityPicker : MonoBehaviour
             TextMeshPro? costTemplate = FindConfirmCostTmp(confirm) ?? template;
             float fs = Math.Max(5f, costTemplate.fontSize);
 
-            _hudQty = CloneTmpLocal(template, _hudRoot.transform, "Qty", _qtyLocal, "1", fs * 1.35f);
+            _hudQty = CloneTmpLocal(template, _hudRoot.transform, "Qty", _qtyLocal, "1", fs * 2.7f);
             _hudCost = CloneTmpLocal(
-                costTemplate, _hudRoot.transform, "TotalCost", _costLocal, "0", fs,
+                costTemplate, _hudRoot.transform, "TotalCost", _costLocal, "0", fs * 2f,
                 TextAlignmentOptions.Left);
 
             // Currency bead first — also used as visible up/down caret template.
@@ -637,7 +637,7 @@ internal sealed class QuantityPicker : MonoBehaviour
             if (srcCostIcon != null)
             {
                 _hudCurrencyIcon = CloneSpriteLocal(
-                    srcCostIcon, _hudRoot.transform, "CurrencyIcon", _currencyLocal, scaleMul: 1f);
+                    srcCostIcon, _hudRoot.transform, "CurrencyIcon", _currencyLocal, scaleMul: 2f);
                 Sprite? currency = _shopStats.GetCurrencySprite();
                 if (currency != null)
                 {
@@ -757,10 +757,10 @@ internal sealed class QuantityPicker : MonoBehaviour
         float rowY = itemLp.y - 3.5f;
         float cx = itemLp.x;
         qtyLocal = new Vector3(cx - 0.9f, rowY, z);
-        upLocal = new Vector3(qtyLocal.x, rowY + 0.95f, z);
-        downLocal = new Vector3(qtyLocal.x, rowY - 0.95f, z);
-        currencyLocal = new Vector3(cx + 0.55f, rowY, z);
-        costLocal = new Vector3(cx + 1.35f, rowY, z);
+        upLocal = new Vector3(qtyLocal.x, rowY + 1.6f, z);
+        downLocal = new Vector3(qtyLocal.x, rowY - 1.6f, z);
+        currencyLocal = new Vector3(cx + 0.9f, rowY, z);
+        costLocal = new Vector3(cx + 2.4f, rowY, z);
     }
 
     /// <summary>
@@ -781,8 +781,8 @@ internal sealed class QuantityPicker : MonoBehaviour
         EnsureArrowSpriteCached();
         if (_cachedArrowSprite != null && styleSrc != null)
         {
-            _hudArrowUp = CloneSpriteCaret(styleSrc, arrowParent, "ArrowUp", upLocal, 90f, 0.85f);
-            _hudArrowDown = CloneSpriteCaret(styleSrc, arrowParent, "ArrowDown", downLocal, 270f, 0.85f);
+            _hudArrowUp = CloneSpriteCaret(styleSrc, arrowParent, "ArrowUp", upLocal, 90f, 2.0f);
+            _hudArrowDown = CloneSpriteCaret(styleSrc, arrowParent, "ArrowDown", downLocal, 270f, 2.0f);
             ApplySprite(_hudArrowUp, _cachedArrowSprite);
             ApplySprite(_hudArrowDown, _cachedArrowSprite);
             RememberArrowBaseScales();
@@ -794,8 +794,8 @@ internal sealed class QuantityPicker : MonoBehaviour
         // 2) Currency bead — known-visible in this HUD (visibility probe that worked).
         if (styleSrc != null && styleSrc.sprite != null)
         {
-            _hudArrowUp = CloneSpriteCaret(styleSrc, arrowParent, "ArrowUp", upLocal, 90f, 0.65f);
-            _hudArrowDown = CloneSpriteCaret(styleSrc, arrowParent, "ArrowDown", downLocal, 270f, 0.65f);
+            _hudArrowUp = CloneSpriteCaret(styleSrc, arrowParent, "ArrowUp", upLocal, 90f, 2.0f);
+            _hudArrowDown = CloneSpriteCaret(styleSrc, arrowParent, "ArrowDown", downLocal, 270f, 2.0f);
             RememberArrowBaseScales();
             MerchantStackerPlugin.Log.LogInfo(
                 $"Arrows from currency sprite '{styleSrc.sprite.name}' size={SpriteSize(_hudArrowUp)}");
