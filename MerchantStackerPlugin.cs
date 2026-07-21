@@ -12,7 +12,7 @@ public class MerchantStackerPlugin : BaseUnityPlugin
 {
     public const string PluginGuid = "io.github.raincloudthedragon.merchantstacker";
     public const string PluginName = "MerchantStacker";
-    public const string PluginVersion = "0.1.2";
+    public const string PluginVersion = "1.0.0";
 
     internal static MerchantStackerPlugin Instance { get; private set; } = null!;
     internal static ManualLogSource Log { get; private set; } = null!;
