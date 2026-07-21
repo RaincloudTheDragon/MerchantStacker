@@ -65,18 +65,6 @@ internal sealed class QuantityPicker : MonoBehaviour
     private static readonly FieldInfo ItemSpriteField =
         AccessTools.Field(typeof(ShopItemStats), "itemSprite");
 
-    private static readonly FieldInfo ScrollUpArrowField =
-        AccessTools.Field(typeof(ScrollView), "upArrow");
-
-    private static readonly FieldInfo ScrollDownArrowField =
-        AccessTools.Field(typeof(ScrollView), "downArrow");
-
-    private static readonly FieldInfo SimpleUpArrowField =
-        AccessTools.Field(typeof(SimpleShopMenu), "upArrow");
-
-    private static readonly FieldInfo SimpleDownArrowField =
-        AccessTools.Field(typeof(SimpleShopMenu), "downArrow");
-
     private bool _active;
     private bool _hijacked;
     private bool _inShop;
@@ -102,6 +90,22 @@ internal sealed class QuantityPicker : MonoBehaviour
     private GameObject? _hiddenConfirmList;
     private GameObject? _hiddenConfirmMsg;
     private readonly List<GameObject> _hiddenNativeCost = new();
+    /// <summary>Cached Yes/No/Costs/etc. — LateUpdate only toggles these (no tree walk).</summary>
+    private readonly List<GameObject> _chromeToKeepOff = new();
+    private GameObject? _itemArtSprite;
+    private GameObject? _itemArtName;
+    private SpriteRenderer? _itemArtSpriteSr;
+    private TextMeshPro? _itemArtNameTmp;
+    private int _lastHudQty = int.MinValue;
+    private int _lastHudTotal = int.MinValue;
+    private bool _lastArrowUpOn;
+    private bool _lastArrowDownOn;
+    private float _maxRecalcTimer;
+    private int _chromeKeepOffFrame;
+    private MeshRenderer? _itemArtNameMr;
+    private Vector3 _qtyLocal;
+    private Vector3 _costLocal;
+    private Vector3 _currencyLocal;
     private Action? _originalYes;
     private Action? _originalNo;
     private Action<int>? _onConfirm;
@@ -219,14 +223,14 @@ internal sealed class QuantityPicker : MonoBehaviour
             return;
         }
 
-        // FSM "Activate Yes No" re-enables chrome after we open — keep it dead every frame.
-        SuppressInShopConfirmChrome();
-        // Cancel/re-enter can leave Item Sprite inactive or renderer disabled — keep art up.
-        EnsureConfirmItemArtVisible();
+        // Throttle — FSM SetActive hook already kills chrome; this is a safety net only.
+        if ((++_chromeKeepOffFrame & 7) == 0)
+        {
+            KeepCachedChromeOff();
+            KeepCachedItemArtVisible();
+        }
 
         // Only abort when the whole shop menu is gone.
-        // Do NOT check ShopItemStats.activeInHierarchy — list rows are often disabled
-        // while Item Confirm Group is up (that was aborting qty every frame).
         Transform? root = _shopRoot != null ? _shopRoot : _shopStats != null ? _shopStats.transform.root : null;
         if (root == null || !root || !root.gameObject.activeInHierarchy)
         {
@@ -234,16 +238,104 @@ internal sealed class QuantityPicker : MonoBehaviour
         }
     }
 
-    /// <summary>Keep vanilla Yes/No/Costs off while qty replaces confirm.</summary>
-    private void SuppressInShopConfirmChrome()
+    /// <summary>FSM may re-enable Yes/No — slap only the cached nodes back off.</summary>
+    private void KeepCachedChromeOff()
     {
-        Transform? root = GetShopMenuRoot();
-        if (root == null)
+        for (int i = 0; i < _chromeToKeepOff.Count; i++)
         {
-            return;
+            GameObject go = _chromeToKeepOff[i];
+            if (go != null && go.activeSelf)
+            {
+                go.SetActive(false);
+            }
+        }
+    }
+
+    private void KeepCachedItemArtVisible()
+    {
+        if (_itemArtSprite != null && !_itemArtSprite.activeSelf)
+        {
+            _itemArtSprite.SetActive(true);
         }
 
-        Patches.ShopConfirmListPatches.SuppressConfirmChromePublic(root);
+        if (_itemArtSpriteSr != null && !_itemArtSpriteSr.enabled)
+        {
+            _itemArtSpriteSr.enabled = true;
+        }
+
+        if (_itemArtName != null && !_itemArtName.activeSelf)
+        {
+            _itemArtName.SetActive(true);
+        }
+
+        if (_itemArtNameTmp != null)
+        {
+            if (!_itemArtNameTmp.enabled)
+            {
+                _itemArtNameTmp.enabled = true;
+            }
+
+            if (_itemArtNameMr != null && !_itemArtNameMr.enabled)
+            {
+                _itemArtNameMr.enabled = true;
+            }
+        }
+    }
+
+    /// <summary>One-time scan when qty opens — feeds KeepCachedChromeOff + SetActive block list.</summary>
+    private void CacheChromeToKeepOff(Transform confirm, Transform? confirmGroup)
+    {
+        _chromeToKeepOff.Clear();
+        var blocked = new HashSet<int>();
+        Transform searchRoot = confirmGroup != null ? confirmGroup : confirm;
+        foreach (Transform t in searchRoot.GetComponentsInChildren<Transform>(true))
+        {
+            if (t == null)
+            {
+                continue;
+            }
+
+            string n = t.name;
+            bool confirmUiList = n == "UI List" && t.parent != null && t.parent.name == "Confirm";
+            if (confirmUiList || n == "Confirm msg" || n == "Costs" || n == "Thankyou"
+                || n == "Money" || n == "Item cost" || n == "Geo Sprite"
+                || ((n == "Yes" || n == "No") && Patches.ShopConfirmListPatches.IsUnderShopConfirmPublic(t)))
+            {
+                _chromeToKeepOff.Add(t.gameObject);
+                blocked.Add(t.gameObject.GetInstanceID());
+            }
+        }
+
+        Patches.ShopConfirmShowPatches.BlockedSetActiveIds = blocked;
+    }
+
+    private void CacheItemArt(Transform layoutParent)
+    {
+        _itemArtSprite = null;
+        _itemArtName = null;
+        _itemArtSpriteSr = null;
+        _itemArtNameTmp = null;
+        foreach (Transform t in layoutParent)
+        {
+            if (t == null)
+            {
+                continue;
+            }
+
+            if (t.name == "Item Sprite")
+            {
+                _itemArtSprite = t.gameObject;
+                _itemArtSpriteSr = t.GetComponent<SpriteRenderer>();
+            }
+            else if (t.name == "Item name")
+            {
+                _itemArtName = t.gameObject;
+                _itemArtNameTmp = t.GetComponent<TextMeshPro>();
+                _itemArtNameMr = _itemArtNameTmp != null
+                    ? _itemArtNameTmp.GetComponent<MeshRenderer>()
+                    : null;
+            }
+        }
     }
 
     private Transform? GetShopMenuRoot()
@@ -270,6 +362,7 @@ internal sealed class QuantityPicker : MonoBehaviour
 
     /// <summary>
     /// Keep confirm item name + logo visible. After cancel, FSM may leave Item Sprite off.
+    /// One-shot / open-path only — LateUpdate uses KeepCachedItemArtVisible.
     /// </summary>
     private void EnsureConfirmItemArtVisible()
     {
@@ -290,46 +383,8 @@ internal sealed class QuantityPicker : MonoBehaviour
             group.gameObject.SetActive(true);
         }
 
-        foreach (Transform t in group.GetComponentsInChildren<Transform>(true))
-        {
-            if (t == null || (t.name != "Item Sprite" && t.name != "Item name"))
-            {
-                continue;
-            }
-
-            // Only the confirm hero art (direct under Item Confirm Group), not Costs/Item Sprite.
-            if (t.parent != group)
-            {
-                continue;
-            }
-
-            if (!t.gameObject.activeSelf)
-            {
-                t.gameObject.SetActive(true);
-            }
-
-            var sr = t.GetComponent<SpriteRenderer>();
-            if (sr != null)
-            {
-                sr.enabled = true;
-                Color c = sr.color;
-                if (c.a < 1f)
-                {
-                    c.a = 1f;
-                    sr.color = c;
-                }
-            }
-
-            var tmp = t.GetComponent<TextMeshPro>();
-            if (tmp != null)
-            {
-                var mr = tmp.GetComponent<MeshRenderer>();
-                if (mr != null)
-                {
-                    mr.enabled = true;
-                }
-            }
-        }
+        CacheItemArt(group);
+        KeepCachedItemArtVisible();
     }
 
     /// <summary>Force-close qty without purchasing (shop closed or lost).</summary>
@@ -534,37 +589,41 @@ internal sealed class QuantityPicker : MonoBehaviour
             }
 
             Transform layoutParent = confirmGroup != null ? confirmGroup : confirm;
-            DumpConfirmGroup(layoutParent);
             EnsureConfirmItemArtVisible();
             HideConfirmChrome(confirm, confirmGroup);
             HideNativeConfirmCosts(confirm);
+            CacheChromeToKeepOff(confirm, confirmGroup);
 
-            // Qty/cost stay on DontDestroyOnLoad (avoids stuck TMP overlays).
+            // Confirm local space (db1c770) — same plane as Item Sprite; destroy with HUD.
             _hudRoot = new GameObject("MerchantStacker_QtyHud");
             _hudRoot.layer = layoutParent.gameObject.layer;
-            _hudRoot.transform.SetParent(transform, false);
+            _hudRoot.transform.SetParent(layoutParent, false);
             _hudRoot.transform.localPosition = Vector3.zero;
             _hudRoot.transform.localRotation = Quaternion.identity;
             _hudRoot.transform.localScale = Vector3.one;
 
-            GetQtyColumnWorld(layoutParent, out Vector3 qtyWorld, out _, out _);
-            GetQtyColumnLocal(layoutParent, out Vector3 qtyLocal, out Vector3 upLocal, out Vector3 downLocal);
-            Vector3 currencyWorld = qtyWorld + layoutParent.TransformVector(new Vector3(1.5f, 0f, 0f));
-            Vector3 costWorld = qtyWorld + layoutParent.TransformVector(new Vector3(2.4f, 0f, 0f));
+            // One centered row under the item:  [↑] qty [↓]   bead  total
+            GetQtyRowLocal(
+                layoutParent,
+                out _qtyLocal,
+                out Vector3 upLocal,
+                out Vector3 downLocal,
+                out _currencyLocal,
+                out _costLocal);
 
             TextMeshPro? costTemplate = FindConfirmCostTmp(confirm) ?? template;
             float fs = Math.Max(5f, costTemplate.fontSize);
 
-            _hudQty = CloneTmpWorld(template, _hudRoot.transform, "Qty", qtyWorld, "1", fs * 1.35f);
-            _hudCost = CloneTmpWorld(
-                costTemplate, _hudRoot.transform, "TotalCost", costWorld, "0", fs,
+            _hudQty = CloneTmpLocal(template, _hudRoot.transform, "Qty", _qtyLocal, "1", fs * 1.35f);
+            _hudCost = CloneTmpLocal(
+                costTemplate, _hudRoot.transform, "TotalCost", _costLocal, "0", fs,
                 TextAlignmentOptions.Left);
 
             var srcCostIcon = CostSpriteField?.GetValue(_shopStats) as SpriteRenderer;
             if (srcCostIcon != null)
             {
-                _hudCurrencyIcon = CloneSpriteWorld(
-                    srcCostIcon, _hudRoot.transform, "CurrencyIcon", currencyWorld, scaleMul: 1f);
+                _hudCurrencyIcon = CloneSpriteLocal(
+                    srcCostIcon, _hudRoot.transform, "CurrencyIcon", _currencyLocal, scaleMul: 1f);
                 Sprite? currency = _shopStats.GetCurrencySprite();
                 if (currency != null)
                 {
@@ -572,8 +631,7 @@ internal sealed class QuantityPicker : MonoBehaviour
                 }
             }
 
-            // tk2d Pointers only render in confirm local space (db1c770) — not world/DDOL.
-            if (TryCreateVerticalArrowsLocal(confirm, layoutParent, upLocal, downLocal))
+            if (TryCreateVerticalArrowsLocal(confirm, _hudRoot.transform, upLocal, downLocal))
             {
                 MerchantStackerPlugin.Log.LogInfo("Qty HUD arrows: local (pointer/small)");
             }
@@ -582,8 +640,12 @@ internal sealed class QuantityPicker : MonoBehaviour
                 MerchantStackerPlugin.Log.LogWarning("Qty HUD: no small arrow templates found");
             }
 
+            _lastHudQty = int.MinValue;
+            _lastHudTotal = int.MinValue;
+            RefreshInShopHud();
+            ReassertHudPoses();
             MerchantStackerPlugin.Log.LogInfo(
-                $"Qty HUD world qty={qtyWorld} local={qtyLocal} arrows={(_hudArrowUp != null)} currency={(_hudCurrencyIcon != null)}");
+                $"Qty HUD row qty={_qtyLocal} cost={_costLocal} worldQty={_hudQty.transform.position}");
         }
         catch (Exception ex)
         {
@@ -597,18 +659,34 @@ internal sealed class QuantityPicker : MonoBehaviour
         _hiddenNativeCost.Clear();
         foreach (Transform t in confirm.GetComponentsInChildren<Transform>(true))
         {
-            if (t == null || t.name != "Costs")
+            if (t == null)
             {
                 continue;
+            }
+
+            string n = t.name;
+            if (n != "Costs" && n != "Money" && n != "Item cost" && n != "Geo Sprite")
+            {
+                continue;
+            }
+
+            // Kill renderers too — SetActive alone can leave a visible flash / hitch fight.
+            foreach (MeshRenderer mr in t.GetComponentsInChildren<MeshRenderer>(true))
+            {
+                mr.enabled = false;
+            }
+
+            foreach (SpriteRenderer sr in t.GetComponentsInChildren<SpriteRenderer>(true))
+            {
+                sr.enabled = false;
             }
 
             if (t.gameObject.activeSelf)
             {
                 t.gameObject.SetActive(false);
-                _hiddenNativeCost.Add(t.gameObject);
             }
 
-            break;
+            _hiddenNativeCost.Add(t.gameObject);
         }
     }
 
@@ -625,101 +703,51 @@ internal sealed class QuantityPicker : MonoBehaviour
         return null;
     }
 
-    /// <summary>World-space qty column just right of the confirm Item Sprite.</summary>
-    private static void GetQtyColumnWorld(
-        Transform layoutParent,
-        out Vector3 qtyWorld,
-        out Vector3 upWorld,
-        out Vector3 downWorld)
-    {
-        GetQtyColumnLocal(layoutParent, out Vector3 qtyLocal, out Vector3 upLocal, out Vector3 downLocal);
-        qtyWorld = layoutParent.TransformPoint(qtyLocal);
-        upWorld = layoutParent.TransformPoint(upLocal);
-        downWorld = layoutParent.TransformPoint(downLocal);
-    }
-
-    /// <summary>Confirm-group local qty column (same plane as Item Sprite, z≈-3).</summary>
-    private static void GetQtyColumnLocal(
+    /// <summary>
+    /// Low row under the art: [qty] then bead+total to its right.
+    /// </summary>
+    private static void GetQtyRowLocal(
         Transform layoutParent,
         out Vector3 qtyLocal,
         out Vector3 upLocal,
-        out Vector3 downLocal)
+        out Vector3 downLocal,
+        out Vector3 currencyLocal,
+        out Vector3 costLocal)
     {
-        Transform? item = FindNamedTransform(layoutParent, "Item Sprite");
-        Vector3 itemLp = item != null ? item.localPosition : new Vector3(-3.4f, 1.5f, -3f);
-        // Prefer Item Sprite under Item Confirm Group (not nested Costs sprites).
-        if (item != null && item.parent != layoutParent)
+        Vector3 itemLp = new Vector3(-3.4f, 1.5f, -3f);
+        foreach (Transform t in layoutParent)
         {
-            foreach (Transform t in layoutParent.GetComponentsInChildren<Transform>(true))
+            if (t != null && t.name == "Item Sprite")
             {
-                if (t != null && t.name == "Item Sprite" && t.parent == layoutParent)
-                {
-                    itemLp = t.localPosition;
-                    break;
-                }
+                itemLp = t.localPosition;
+                break;
             }
         }
 
         float z = itemLp.z;
-        qtyLocal = new Vector3(itemLp.x + 2.55f, itemLp.y, z);
-        upLocal = new Vector3(qtyLocal.x, qtyLocal.y + 1.05f, z);
-        downLocal = new Vector3(qtyLocal.x, qtyLocal.y - 1.05f, z);
+        // Much lower than the art; qty left of bead/cost.
+        float rowY = itemLp.y - 3.5f;
+        float cx = itemLp.x;
+        qtyLocal = new Vector3(cx - 0.9f, rowY, z);
+        upLocal = new Vector3(qtyLocal.x, rowY + 0.95f, z);
+        downLocal = new Vector3(qtyLocal.x, rowY - 0.95f, z);
+        currencyLocal = new Vector3(cx + 0.55f, rowY, z);
+        costLocal = new Vector3(cx + 1.35f, rowY, z);
     }
 
-    /// <summary>
-    /// Pointer carets in confirm local space (db1c770). World/DDOL clones stay invisible.
-    /// </summary>
+    /// <summary>Pointer carets parented under qty HUD (confirm local space).</summary>
     private bool TryCreateVerticalArrowsLocal(
         Transform confirm,
-        Transform layoutParent,
+        Transform arrowParent,
         Vector3 upLocal,
         Vector3 downLocal)
     {
-        Transform? pointer = FindNamedTransform(confirm, "Pointer L")
-            ?? FindNamedTransform(layoutParent, "Pointer L");
+        Transform? pointer = FindNamedTransform(confirm, "Pointer L");
         if (pointer != null)
         {
-            _hudArrowUp = CloneArrowLocal(pointer.gameObject, layoutParent, "ArrowUp", upLocal, 90f, 0.75f);
-            _hudArrowDown = CloneArrowLocal(pointer.gameObject, layoutParent, "ArrowDown", downLocal, -90f, 0.75f);
+            _hudArrowUp = CloneArrowLocal(pointer.gameObject, arrowParent, "ArrowUp", upLocal, 90f, 0.75f);
+            _hudArrowDown = CloneArrowLocal(pointer.gameObject, arrowParent, "ArrowDown", downLocal, -90f, 0.75f);
             MerchantStackerPlugin.Log.LogInfo("Arrows from Confirm Pointer L (local vertical)");
-            return true;
-        }
-
-        foreach (SimpleShopMenu menu in Resources.FindObjectsOfTypeAll<SimpleShopMenu>())
-        {
-            if (menu == null || !menu.gameObject.scene.IsValid())
-            {
-                continue;
-            }
-
-            var u = SimpleUpArrowField?.GetValue(menu) as Component;
-            var d = SimpleDownArrowField?.GetValue(menu) as Component;
-            if (u == null || d == null || IsWideArrow(u.gameObject) || IsWideArrow(d.gameObject))
-            {
-                continue;
-            }
-
-            _hudArrowUp = CloneArrowLocal(u.gameObject, layoutParent, "ArrowUp", upLocal, 0f, 0.85f);
-            _hudArrowDown = CloneArrowLocal(d.gameObject, layoutParent, "ArrowDown", downLocal, 0f, 0.85f);
-            MerchantStackerPlugin.Log.LogInfo("Arrows from SimpleShopMenu up/down (local)");
-            return true;
-        }
-
-        return false;
-    }
-
-    /// <summary>Quest/save pan arrows are very wide; menu/slider carets are compact.</summary>
-    private static bool IsWideArrow(GameObject go)
-    {
-        var mr = go.GetComponent<MeshRenderer>();
-        if (mr != null && mr.bounds.size.x > 1.6f)
-        {
-            return true;
-        }
-
-        var sr = go.GetComponent<SpriteRenderer>();
-        if (sr != null && sr.bounds.size.x > 1.6f)
-        {
             return true;
         }
 
@@ -734,9 +762,10 @@ internal sealed class QuantityPicker : MonoBehaviour
         float rotationZ,
         float scale)
     {
-        var go = UnityEngine.Object.Instantiate(template, layoutParent);
+        var go = UnityEngine.Object.Instantiate(template);
         go.name = name;
         go.layer = layoutParent.gameObject.layer;
+        go.transform.SetParent(layoutParent, false);
         go.SetActive(true);
         go.transform.localPosition = localPos;
         go.transform.localRotation = Quaternion.Euler(0f, 0f, rotationZ);
@@ -805,37 +834,6 @@ internal sealed class QuantityPicker : MonoBehaviour
         }
     }
 
-    private static void DumpConfirmGroup(Transform hudParent)
-    {
-        var lines = new List<string> { $"Confirm dump '{PathOf(hudParent)}':" };
-        foreach (Transform t in hudParent.GetComponentsInChildren<Transform>(true))
-        {
-            if (t == null || t == hudParent)
-            {
-                continue;
-            }
-
-            // Only direct-ish useful nodes: sprites + TMP.
-            var tmp = t.GetComponent<TextMeshPro>();
-            var sr = t.GetComponent<SpriteRenderer>();
-            var mr = t.GetComponent<MeshRenderer>();
-            if (tmp == null && sr == null && mr == null)
-            {
-                continue;
-            }
-
-            string detail = tmp != null
-                ? $"TMP '{tmp.text}' size={tmp.fontSize:0.#}"
-                : sr != null
-                    ? $"SR '{sr.sprite?.name}' bounds={sr.bounds.size}"
-                    : "Mesh";
-            Vector3 lp = t.localPosition;
-            lines.Add($"  {PathOf(t)} local=({lp.x:0.##},{lp.y:0.##},{lp.z:0.##}) active={t.gameObject.activeSelf} {detail}");
-        }
-
-        MerchantStackerPlugin.Log.LogInfo(string.Join("\n", lines));
-    }
-
     private static bool ContainsIgnore(string haystack, string needle) =>
         haystack.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
 
@@ -854,6 +852,7 @@ internal sealed class QuantityPicker : MonoBehaviour
                 BuildConfirmQtyHud();
             }
 
+            ReassertHudPoses();
             RefreshInShopHud();
         }
     }
@@ -861,24 +860,47 @@ internal sealed class QuantityPicker : MonoBehaviour
     private void RefreshInShopHud()
     {
         int total = _unitCost * _quantity;
-        string qtyLine = _quantity.ToString(CultureInfo.InvariantCulture);
-        string costLine = total.ToString(CultureInfo.InvariantCulture);
-
-        ApplyTmp(_hudQty, qtyLine);
-        ApplyTmp(_hudCost, costLine);
-        SetArrowVisible(_hudArrowUp, _quantity < _max);
-        SetArrowVisible(_hudArrowDown, _quantity > _min);
-
-        if (_hudCurrencyIcon != null && _shopStats != null)
+        bool qtyChanged = _quantity != _lastHudQty;
+        bool totalChanged = total != _lastHudTotal;
+        if (!qtyChanged && !totalChanged)
         {
-            Sprite? currency = _shopStats.GetCurrencySprite();
-            if (currency != null)
-            {
-                _hudCurrencyIcon.sprite = currency;
-            }
+            return;
+        }
 
+        _lastHudQty = _quantity;
+        _lastHudTotal = total;
+
+        if (qtyChanged)
+        {
+            ApplyTmp(_hudQty, _quantity.ToString(CultureInfo.InvariantCulture));
+        }
+
+        if (totalChanged)
+        {
+            ApplyTmp(_hudCost, total.ToString(CultureInfo.InvariantCulture));
+        }
+
+        bool upOn = _quantity < _max;
+        bool downOn = _quantity > _min;
+        if (upOn != _lastArrowUpOn)
+        {
+            _lastArrowUpOn = upOn;
+            SetArrowVisible(_hudArrowUp, upOn);
+        }
+
+        if (downOn != _lastArrowDownOn)
+        {
+            _lastArrowDownOn = downOn;
+            SetArrowVisible(_hudArrowDown, downOn);
+        }
+
+        if (_hudCurrencyIcon != null)
+        {
             _hudCurrencyIcon.enabled = true;
-            _hudCurrencyIcon.gameObject.SetActive(true);
+            if (!_hudCurrencyIcon.gameObject.activeSelf)
+            {
+                _hudCurrencyIcon.gameObject.SetActive(true);
+            }
         }
     }
 
@@ -892,17 +914,6 @@ internal sealed class QuantityPicker : MonoBehaviour
         // Don't tint tk2d atlas materials (no _Color) — shrink slightly when at range end.
         float baseScale = 0.75f;
         arrow.transform.localScale = Vector3.one * (fullyVisible ? baseScale : baseScale * 0.55f);
-
-        foreach (MeshRenderer mr in arrow.GetComponentsInChildren<MeshRenderer>(true))
-        {
-            mr.enabled = true;
-        }
-
-        foreach (SpriteRenderer sr in arrow.GetComponentsInChildren<SpriteRenderer>(true))
-        {
-            sr.enabled = true;
-        }
-
         arrow.GetComponent<InvAnimateUpAndDown>()?.Show();
     }
 
@@ -931,9 +942,9 @@ internal sealed class QuantityPicker : MonoBehaviour
             if (tmp.text != value)
             {
                 tmp.SetText(value);
+                tmp.ForceMeshUpdate(true);
             }
 
-            tmp.ForceMeshUpdate(true);
             var mr = tmp.GetComponent<MeshRenderer>();
             if (mr != null)
             {
@@ -958,21 +969,50 @@ internal sealed class QuantityPicker : MonoBehaviour
         tmp.color = c;
     }
 
-    private static TextMeshPro CloneTmpWorld(
+    private void ReassertHudPoses()
+    {
+        if (_hudQty != null)
+        {
+            SetLocalPose(_hudQty.transform, _qtyLocal, Vector3.one);
+        }
+
+        if (_hudCost != null)
+        {
+            SetLocalPose(_hudCost.transform, _costLocal, Vector3.one);
+        }
+
+        if (_hudCurrencyIcon != null)
+        {
+            SetLocalPose(_hudCurrencyIcon.transform, _currencyLocal, _hudCurrencyIcon.transform.localScale);
+        }
+    }
+
+    private static void SetLocalPose(Transform t, Vector3 localPos, Vector3 localScale)
+    {
+        t.localPosition = localPos;
+        t.localRotation = Quaternion.identity;
+        t.localScale = localScale;
+        if (t is RectTransform rt)
+        {
+            rt.anchoredPosition3D = localPos;
+        }
+    }
+
+    private static TextMeshPro CloneTmpLocal(
         TextMeshPro template,
         Transform parent,
         string name,
-        Vector3 worldPos,
+        Vector3 localPos,
         string text,
         float fontSize,
         TextAlignmentOptions alignment = TextAlignmentOptions.Center)
     {
-        var go = UnityEngine.Object.Instantiate(template.gameObject, parent);
+        // Unparented Instantiate + SetParent(false) so we don't inherit the template's world pose.
+        var go = UnityEngine.Object.Instantiate(template.gameObject);
         go.name = name;
+        go.transform.SetParent(parent, false);
         go.SetActive(true);
-        go.transform.position = worldPos;
-        go.transform.rotation = Quaternion.identity;
-        go.transform.localScale = Vector3.one;
+        SetLocalPose(go.transform, localPos, Vector3.one);
 
         for (int i = go.transform.childCount - 1; i >= 0; i--)
         {
@@ -1000,19 +1040,18 @@ internal sealed class QuantityPicker : MonoBehaviour
         return tmp;
     }
 
-    private static SpriteRenderer CloneSpriteWorld(
+    private static SpriteRenderer CloneSpriteLocal(
         SpriteRenderer template,
         Transform parent,
         string name,
-        Vector3 worldPos,
+        Vector3 localPos,
         float scaleMul)
     {
-        var go = UnityEngine.Object.Instantiate(template.gameObject, parent);
+        var go = UnityEngine.Object.Instantiate(template.gameObject);
         go.name = name;
+        go.transform.SetParent(parent, false);
         go.SetActive(true);
-        go.transform.position = worldPos;
-        go.transform.rotation = Quaternion.identity;
-        go.transform.localScale = template.transform.localScale * scaleMul;
+        SetLocalPose(go.transform, localPos, template.transform.localScale * scaleMul);
 
         var sr = go.GetComponent<SpriteRenderer>();
         sr.enabled = true;
@@ -1125,20 +1164,9 @@ internal sealed class QuantityPicker : MonoBehaviour
             }
         }
 
-        // Wipe our TMP meshes before destroy so world-space digits can't linger.
+        // Wipe our TMP meshes before destroy so digits can't linger.
         ClearTmpVisual(_hudQty);
         ClearTmpVisual(_hudCost);
-
-        // Arrows live under Item Confirm Group (not _hudRoot).
-        if (_hudArrowUp != null)
-        {
-            UnityEngine.Object.DestroyImmediate(_hudArrowUp);
-        }
-
-        if (_hudArrowDown != null)
-        {
-            UnityEngine.Object.DestroyImmediate(_hudArrowDown);
-        }
 
         if (_hudRoot != null)
         {
@@ -1151,6 +1179,13 @@ internal sealed class QuantityPicker : MonoBehaviour
         _hudArrowDown = null;
         _hudCost = null;
         _hudCurrencyIcon = null;
+        _chromeToKeepOff.Clear();
+        Patches.ShopConfirmShowPatches.BlockedSetActiveIds = null;
+        _itemArtSprite = null;
+        _itemArtName = null;
+        _itemArtSpriteSr = null;
+        _itemArtNameTmp = null;
+        _itemArtNameMr = null;
         ScrubLeftoverQtyHud();
 
         if (restoreConfirmChrome)
@@ -1265,7 +1300,7 @@ internal sealed class QuantityPicker : MonoBehaviour
                     || (go.transform.parent != null
                         && (go.transform.parent.name == "MerchantStacker_QtyHud"
                             || go.transform.parent.name == "MerchantStacker_QuantityPicker"
-                            || ((go.name == "ArrowUp" || go.name == "ArrowDown")
+                            || (go.name == "MerchantStacker_QtyHud"
                                 && go.transform.parent.name == "Item Confirm Group")));
                 if (!ours)
                 {
@@ -1307,20 +1342,6 @@ internal sealed class QuantityPicker : MonoBehaviour
         _hudArrowDown = null;
         _hudCost = null;
         _hudCurrencyIcon = null;
-    }
-
-    private static string PathOf(Transform t)
-    {
-        string path = t.name;
-        Transform? p = t.parent;
-        int guard = 0;
-        while (p != null && guard++ < 6)
-        {
-            path = p.name + "/" + path;
-            p = p.parent;
-        }
-
-        return path;
     }
 
     private System.Collections.IEnumerator RefreshAfterOpen()
@@ -1527,19 +1548,32 @@ internal sealed class QuantityPicker : MonoBehaviour
             return;
         }
 
-        // Shop FSMs often rewrite title/cost every frame — keep ours on top.
-        if (_inShop)
+        // Recalc affordability occasionally — not every frame (was hitching).
+        _maxRecalcTimer -= Time.unscaledDeltaTime;
+        if (_maxRecalcTimer <= 0f)
         {
-            RefreshInShopHud();
-        }
+            _maxRecalcTimer = 0.25f;
+            int affordable = Eligibility.GetAffordableCount(_unitCost, _currency);
+            int room = _item != null ? Eligibility.GetRoomUntilCap(_item) : _max;
+            int newMax = Math.Max(1, Math.Min(Math.Max(1, affordable), Math.Max(1, room)));
+            if (newMax != _max)
+            {
+                _max = newMax;
+                if (_quantity > _max)
+                {
+                    _quantity = _max;
+                }
 
-        int affordable = Eligibility.GetAffordableCount(_unitCost, _currency);
-        int room = _item != null ? Eligibility.GetRoomUntilCap(_item) : _max;
-        _max = Math.Max(1, Math.Min(Math.Max(1, affordable), Math.Max(1, room)));
-        if (_quantity > _max)
-        {
-            _quantity = _max;
-            RefreshDisplay();
+                if (_inShop)
+                {
+                    _lastHudQty = int.MinValue;
+                    RefreshInShopHud();
+                }
+                else
+                {
+                    RefreshDisplay();
+                }
+            }
         }
 
         var ih = ManagerSingleton<InputHandler>.Instance;

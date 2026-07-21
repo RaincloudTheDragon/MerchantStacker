@@ -17,11 +17,37 @@ internal static class ShopConfirmShowPatches
 {
     private static bool _inSetActiveHook;
 
+    /// <summary>
+    /// Instance IDs that must not SetActive(true) while qty is open.
+    /// Null when qty closed so the prefix is a single null-check on every SetActive.
+    /// </summary>
+    internal static HashSet<int>? BlockedSetActiveIds;
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(GameObject), nameof(GameObject.SetActive))]
+    private static bool GameObjectSetActivePrefix(GameObject __instance, bool value)
+    {
+        // Hot path: almost every SetActive in the game hits this — keep it tiny.
+        if (!value)
+        {
+            return true;
+        }
+
+        HashSet<int>? blocked = BlockedSetActiveIds;
+        return blocked == null || !blocked.Contains(__instance.GetInstanceID());
+    }
+
     [HarmonyPostfix]
     [HarmonyPatch(typeof(GameObject), nameof(GameObject.SetActive))]
     private static void GameObjectSetActivePostfix(GameObject __instance, bool value)
     {
         if (!value || _inSetActiveHook || __instance == null)
+        {
+            return;
+        }
+
+        // Qty open: Prefix already blocked chrome by instance ID.
+        if (BlockedSetActiveIds != null)
         {
             return;
         }
@@ -37,42 +63,9 @@ internal static class ShopConfirmShowPatches
         bool underConfirmUiList = n == "UI List"
             && __instance.transform.parent != null
             && __instance.transform.parent.name == "Confirm";
-        bool underConfirmChrome = underConfirmUiList
-            || n == "Confirm msg"
-            || n == "Costs"
-            || n == "Thankyou"
-            || ((n == "Yes" || n == "No")
-                && ShopConfirmListPatches.IsUnderShopConfirmPublic(__instance.transform));
 
         if (n == "UI List" && !underConfirmUiList)
         {
-            return;
-        }
-
-        // Qty already owns the pad — FSM "Activate Yes No" re-enables chrome after we open.
-        // Kill Yes/No/Costs immediately so left-stick can't drive vanilla confirm.
-        if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen
-            && (underConfirmChrome || n == "Confirm" || n == "Item Confirm Group"))
-        {
-            if (underConfirmChrome || n == "UI List" || n == "Confirm msg" || n == "Costs"
-                || n == "Yes" || n == "No" || n == "Thankyou")
-            {
-                try
-                {
-                    _inSetActiveHook = true;
-                    __instance.SetActive(false);
-                }
-                finally
-                {
-                    _inSetActiveHook = false;
-                }
-            }
-
-            if (n == "Confirm" || n == "Item Confirm Group")
-            {
-                ShopConfirmListPatches.SuppressConfirmChromePublic(__instance.transform);
-            }
-
             return;
         }
 
