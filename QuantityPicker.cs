@@ -753,14 +753,15 @@ internal sealed class QuantityPicker : MonoBehaviour
         }
 
         float z = itemLp.z;
-        // Much lower than the art; qty left of bead/cost.
+        // Row under art: qty + carets, then bead, then total — nudged left to center in the pane.
         float rowY = itemLp.y - 3.5f;
-        float cx = itemLp.x;
+        float cx = itemLp.x - 0.85f;
         qtyLocal = new Vector3(cx - 0.9f, rowY, z);
-        upLocal = new Vector3(qtyLocal.x, rowY + 1.6f, z);
-        downLocal = new Vector3(qtyLocal.x, rowY - 1.6f, z);
-        currencyLocal = new Vector3(cx + 0.9f, rowY, z);
-        costLocal = new Vector3(cx + 2.4f, rowY, z);
+        upLocal = new Vector3(qtyLocal.x, rowY + 1.1f, z);
+        downLocal = new Vector3(qtyLocal.x, rowY - 1.1f, z);
+        currencyLocal = new Vector3(cx + 0.85f, rowY, z);
+        // Cost sits tight against the bead (TMP is left-aligned).
+        costLocal = new Vector3(cx + 1.55f, rowY, z);
     }
 
     /// <summary>
