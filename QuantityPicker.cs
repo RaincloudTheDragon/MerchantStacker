@@ -65,6 +65,20 @@ internal sealed class QuantityPicker : MonoBehaviour
     private static readonly FieldInfo ItemSpriteField =
         AccessTools.Field(typeof(ShopItemStats), "itemSprite");
 
+    private static readonly FieldInfo ScrollUpArrowField =
+        AccessTools.Field(typeof(ScrollView), "upArrow");
+
+    private static readonly FieldInfo ScrollDownArrowField =
+        AccessTools.Field(typeof(ScrollView), "downArrow");
+
+    /// <summary>Cached menu caret mesh/material extracted once from a live Pointer/ScrollView arrow.</summary>
+    private static Mesh? _cachedCaretMesh;
+    private static Material? _cachedCaretMaterial;
+    private static int _cachedCaretSortLayer;
+    private static int _cachedCaretSortOrder;
+    private static Sprite? _cachedArrowSprite;
+    private static bool _arrowAssetsSearched;
+
     private bool _active;
     private bool _hijacked;
     private bool _inShop;
@@ -750,8 +764,8 @@ internal sealed class QuantityPicker : MonoBehaviour
     }
 
     /// <summary>
-    /// Visible carets from currency SpriteRenderer (same draw path as cost bead).
-    /// Pointer L tk2d kept as fallback with db1c770 simple local scale.
+    /// Prefer SpriteRenderer carets (bead test proved visible). tk2d mesh bake is unreliable
+    /// (tiny mesh + atlas material often draws nothing on a plain MeshRenderer).
     /// </summary>
     private bool TryCreateVerticalArrowsLocal(
         Transform confirm,
@@ -760,51 +774,244 @@ internal sealed class QuantityPicker : MonoBehaviour
         Vector3 upLocal,
         Vector3 downLocal)
     {
-        // 1) Currency bead — proven visible next to the total.
-        SpriteRenderer? bead = _hudCurrencyIcon;
-        if (bead == null && _shopStats != null)
-        {
-            bead = CostSpriteField?.GetValue(_shopStats) as SpriteRenderer;
-        }
+        SpriteRenderer? styleSrc = _hudCurrencyIcon
+            ?? CostSpriteField?.GetValue(_shopStats) as SpriteRenderer;
 
-        if (bead != null && bead.sprite != null)
+        // 1) Unity Sprite arrow on the working SpriteRenderer setup.
+        EnsureArrowSpriteCached();
+        if (_cachedArrowSprite != null && styleSrc != null)
         {
-            _hudArrowUp = CloneSpriteCaret(bead, arrowParent, "ArrowUp", upLocal, 0f, 0.65f);
-            _hudArrowDown = CloneSpriteCaret(bead, arrowParent, "ArrowDown", downLocal, 180f, 0.65f);
+            _hudArrowUp = CloneSpriteCaret(styleSrc, arrowParent, "ArrowUp", upLocal, 90f, 0.85f);
+            _hudArrowDown = CloneSpriteCaret(styleSrc, arrowParent, "ArrowDown", downLocal, 270f, 0.85f);
+            ApplySprite(_hudArrowUp, _cachedArrowSprite);
+            ApplySprite(_hudArrowDown, _cachedArrowSprite);
             RememberArrowBaseScales();
             MerchantStackerPlugin.Log.LogInfo(
-                $"Arrows from currency sprite '{bead.sprite.name}' size={SpriteSize(_hudArrowUp)}");
+                $"Arrows from sprite '{_cachedArrowSprite.name}' size={SpriteSize(_hudArrowUp)}");
+            return true;
+        }
+
+        // 2) Currency bead — known-visible in this HUD (visibility probe that worked).
+        if (styleSrc != null && styleSrc.sprite != null)
+        {
+            _hudArrowUp = CloneSpriteCaret(styleSrc, arrowParent, "ArrowUp", upLocal, 90f, 0.65f);
+            _hudArrowDown = CloneSpriteCaret(styleSrc, arrowParent, "ArrowDown", downLocal, 270f, 0.65f);
+            RememberArrowBaseScales();
+            MerchantStackerPlugin.Log.LogInfo(
+                $"Arrows from currency sprite '{styleSrc.sprite.name}' size={SpriteSize(_hudArrowUp)}");
+            return true;
+        }
+
+        // 3) Optional tk2d mesh bake only if source geometry is already substantial.
+        EnsureCaretMeshCached(confirm, layoutParent);
+        if (_cachedCaretMesh != null && _cachedCaretMaterial != null)
+        {
+            _hudArrowUp = CreateMeshCaret(arrowParent, "ArrowUp", upLocal, 90f, 0.9f);
+            _hudArrowDown = CreateMeshCaret(arrowParent, "ArrowDown", downLocal, -90f, 0.9f);
+            RememberArrowBaseScales();
+            MerchantStackerPlugin.Log.LogInfo(
+                $"Arrows from tk2d caret mesh size={MeshSize(_hudArrowUp)}");
             return _hudArrowUp != null && _hudArrowDown != null;
         }
 
-        // 2) Pointer L — db1c770 style (simple scale; lossy-preservation made localScale=64).
+        return false;
+    }
+
+    /// <summary>
+    /// Capture Pointer/ScrollView tk2d mesh+material once. Plain MeshFilter clones render;
+    /// full Pointer Instantiate did not (InvAnimate / empty clone).
+    /// </summary>
+    private static void EnsureCaretMeshCached(Transform confirm, Transform layoutParent)
+    {
+        if (_cachedCaretMesh != null && _cachedCaretMaterial != null)
+        {
+            return;
+        }
+
+        GameObject? src = null;
+
         Transform? pointer = FindNamedTransform(confirm, "Pointer L")
             ?? FindNamedTransform(layoutParent, "Pointer L");
-        if (pointer == null)
+        if (pointer != null)
+        {
+            Transform? yes = pointer.parent;
+            while (yes != null && yes.name != "Yes" && yes.name != "Confirm")
+            {
+                yes = yes.parent;
+            }
+
+            if (yes != null && yes.name == "Yes" && !yes.gameObject.activeSelf)
+            {
+                yes.gameObject.SetActive(true);
+            }
+
+            pointer.gameObject.SetActive(true);
+            pointer.GetComponent<InvAnimateUpAndDown>()?.Show();
+            src = pointer.gameObject;
+        }
+
+        if (src == null)
+        {
+            foreach (ScrollView view in Resources.FindObjectsOfTypeAll<ScrollView>())
+            {
+                if (view == null || !view.gameObject.scene.IsValid())
+                {
+                    continue;
+                }
+
+                var up = ScrollUpArrowField?.GetValue(view) as Component;
+                if (up == null)
+                {
+                    continue;
+                }
+
+                up.gameObject.SetActive(true);
+                (up as InvAnimateUpAndDown)?.Show();
+                src = up.gameObject;
+                break;
+            }
+        }
+
+        if (src == null)
+        {
+            return;
+        }
+
+        var mf = src.GetComponentInChildren<MeshFilter>(true);
+        var mr = src.GetComponentInChildren<MeshRenderer>(true);
+        if (mf == null || mr == null || mf.sharedMesh == null || mr.sharedMaterial == null)
+        {
+            MerchantStackerPlugin.Log.LogWarning(
+                $"Caret bake skipped: mesh={mf?.sharedMesh != null} mat={mr?.sharedMaterial != null}");
+            return;
+        }
+
+        Vector3 meshSize = mf.sharedMesh.bounds.size;
+        if (Mathf.Max(meshSize.x, meshSize.y) < 0.08f)
+        {
+            // Pointer often reports a near-empty mesh when cloned/baked — don't cache it.
+            MerchantStackerPlugin.Log.LogInfo(
+                $"Caret bake skipped: mesh too small ({meshSize})");
+            return;
+        }
+
+        // Own copy so hiding/destroying the template can't clear our mesh.
+        _cachedCaretMesh = UnityEngine.Object.Instantiate(mf.sharedMesh);
+        _cachedCaretMesh.name = "MerchantStacker_CaretMesh";
+        _cachedCaretMaterial = mr.sharedMaterial;
+        _cachedCaretSortLayer = mr.sortingLayerID;
+        _cachedCaretSortOrder = Math.Max(mr.sortingOrder + 20, 260);
+        MerchantStackerPlugin.Log.LogInfo(
+            $"Cached tk2d caret mesh verts={_cachedCaretMesh.vertexCount} "
+            + $"bounds={_cachedCaretMesh.bounds.size}");
+    }
+
+    private static void EnsureArrowSpriteCached()
+    {
+        if (_arrowAssetsSearched)
+        {
+            return;
+        }
+
+        _arrowAssetsSearched = true;
+
+        // Prefer SpriteRenderers already in the loaded inventory UI.
+        foreach (InventoryArrowContainer box in Resources.FindObjectsOfTypeAll<InventoryArrowContainer>())
+        {
+            if (box == null || !box.gameObject.scene.IsValid())
+            {
+                continue;
+            }
+
+            foreach (SpriteRenderer sr in box.GetComponentsInChildren<SpriteRenderer>(true))
+            {
+                if (sr?.sprite != null && LooksLikeArrowSprite(sr.sprite.name, sr.gameObject.name))
+                {
+                    _cachedArrowSprite = sr.sprite;
+                    MerchantStackerPlugin.Log.LogInfo($"Cached arrow sprite from InventoryArrowContainer '{sr.sprite.name}'");
+                    return;
+                }
+            }
+        }
+
+        foreach (Sprite sp in Resources.FindObjectsOfTypeAll<Sprite>())
+        {
+            if (sp == null || !LooksLikeArrowSprite(sp.name, sp.name))
+            {
+                continue;
+            }
+
+            // Prefer compact UI carets over map/wide art.
+            if (sp.rect.width > 128f || sp.rect.height > 128f)
+            {
+                continue;
+            }
+
+            _cachedArrowSprite = sp;
+            MerchantStackerPlugin.Log.LogInfo($"Cached arrow sprite '{sp.name}' ({sp.rect.width}x{sp.rect.height})");
+            return;
+        }
+    }
+
+    private static bool LooksLikeArrowSprite(string spriteName, string goName)
+    {
+        string n = spriteName + " " + goName;
+        if (ContainsIgnore(n, "map") || ContainsIgnore(n, "quest") || ContainsIgnore(n, "pan")
+            || ContainsIgnore(n, "compass") || ContainsIgnore(n, "marker"))
         {
             return false;
         }
 
-        Transform? yes = pointer.parent;
-        while (yes != null && yes.name != "Yes" && yes.name != "Confirm")
+        return ContainsIgnore(n, "arrow") || ContainsIgnore(n, "caret") || ContainsIgnore(n, "chevron")
+            || ContainsIgnore(n, "pointer");
+    }
+
+    private static GameObject CreateMeshCaret(
+        Transform parent,
+        string name,
+        Vector3 localPos,
+        float rotationZ,
+        float scale)
+    {
+        var go = new GameObject(name);
+        go.layer = parent.gameObject.layer;
+        go.transform.SetParent(parent, false);
+        go.transform.localPosition = localPos;
+        go.transform.localRotation = Quaternion.Euler(0f, 0f, rotationZ);
+        go.transform.localScale = Vector3.one * scale;
+
+        var mf = go.AddComponent<MeshFilter>();
+        mf.sharedMesh = _cachedCaretMesh;
+
+        var mr = go.AddComponent<MeshRenderer>();
+        mr.sharedMaterial = _cachedCaretMaterial;
+        mr.sortingLayerID = _cachedCaretSortLayer;
+        mr.sortingOrder = _cachedCaretSortOrder;
+        mr.enabled = true;
+
+        // If baked mesh is tiny in world space, enlarge until readable (~0.8uu).
+        float extent = Mathf.Max(mr.bounds.size.x, mr.bounds.size.y);
+        if (extent > 1e-4f && extent < 0.5f)
         {
-            yes = yes.parent;
+            go.transform.localScale *= 0.8f / extent;
         }
 
-        if (yes != null && yes.name == "Yes" && !yes.gameObject.activeSelf)
+        return go;
+    }
+
+    private static void ApplySprite(GameObject? go, Sprite sprite)
+    {
+        if (go == null)
         {
-            yes.gameObject.SetActive(true);
+            return;
         }
 
-        pointer.gameObject.SetActive(true);
-        pointer.GetComponent<InvAnimateUpAndDown>()?.Show();
-
-        _hudArrowUp = CloneArrowLocal(pointer.gameObject, arrowParent, "ArrowUp", upLocal, 90f, 0.85f);
-        _hudArrowDown = CloneArrowLocal(pointer.gameObject, arrowParent, "ArrowDown", downLocal, -90f, 0.85f);
-        RememberArrowBaseScales();
-        MerchantStackerPlugin.Log.LogInfo(
-            $"Arrows from Pointer L size={MeshSize(_hudArrowUp)} local={_hudArrowUp.transform.localScale}");
-        return _hudArrowUp != null && _hudArrowDown != null;
+        var sr = go.GetComponent<SpriteRenderer>();
+        if (sr != null)
+        {
+            sr.sprite = sprite;
+            sr.enabled = true;
+        }
     }
 
     private void RememberArrowBaseScales()
@@ -862,39 +1069,6 @@ internal sealed class QuantityPicker : MonoBehaviour
 
         var sr = go.GetComponentInChildren<SpriteRenderer>(true);
         return sr != null ? sr.bounds.size : Vector3.zero;
-    }
-
-    /// <summary>db1c770-style: Instantiate under parent, fixed local scale (not lossy).</summary>
-    private static GameObject CloneArrowLocal(
-        GameObject template,
-        Transform parent,
-        string name,
-        Vector3 localPos,
-        float rotationZ,
-        float scale)
-    {
-        var go = UnityEngine.Object.Instantiate(template, parent);
-        go.name = name;
-        go.layer = parent.gameObject.layer;
-        go.SetActive(true);
-        go.transform.localPosition = localPos;
-        go.transform.localRotation = Quaternion.Euler(0f, 0f, rotationZ);
-        go.transform.localScale = Vector3.one * scale;
-
-        var anim = go.GetComponent<InvAnimateUpAndDown>();
-        anim?.Show();
-        if (anim != null)
-        {
-            UnityEngine.Object.Destroy(anim);
-        }
-
-        foreach (MeshRenderer mr in go.GetComponentsInChildren<MeshRenderer>(true))
-        {
-            mr.enabled = true;
-            mr.sortingOrder = Math.Max(mr.sortingOrder, 260);
-        }
-
-        return go;
     }
 
     /// <summary>Up/down carets from a SpriteRenderer already proven visible in this HUD.</summary>
