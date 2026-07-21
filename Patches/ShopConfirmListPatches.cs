@@ -28,7 +28,8 @@ internal static class ShopConfirmShowPatches
 
         string n = __instance.name;
         if (n != "Item Confirm Group" && n != "Confirm" && n != "UI List"
-            && n != "Yes" && n != "No" && n != "Confirm msg" && n != "Costs")
+            && n != "Yes" && n != "No" && n != "Confirm msg" && n != "Costs"
+            && n != "Thankyou")
         {
             return;
         }
@@ -39,6 +40,7 @@ internal static class ShopConfirmShowPatches
         bool underConfirmChrome = underConfirmUiList
             || n == "Confirm msg"
             || n == "Costs"
+            || n == "Thankyou"
             || ((n == "Yes" || n == "No")
                 && ShopConfirmListPatches.IsUnderShopConfirmPublic(__instance.transform));
 
@@ -53,7 +55,7 @@ internal static class ShopConfirmShowPatches
             && (underConfirmChrome || n == "Confirm" || n == "Item Confirm Group"))
         {
             if (underConfirmChrome || n == "UI List" || n == "Confirm msg" || n == "Costs"
-                || n == "Yes" || n == "No")
+                || n == "Yes" || n == "No" || n == "Thankyou")
             {
                 try
                 {
@@ -74,29 +76,39 @@ internal static class ShopConfirmShowPatches
             return;
         }
 
-        if (!ShopConfirmListPatches.CanInterceptConfirmInputPublic()
-            || QuantityPicker.Instance == null)
+        if (__instance.transform.root.GetComponentInChildren<ShopMenuStock>(true) == null)
         {
             return;
         }
 
-        if (__instance.transform.root.GetComponentInChildren<ShopMenuStock>(true) == null)
+        GameObject? confirmGroup = n == "Item Confirm Group"
+            ? __instance
+            : ShopConfirmListPatches.FindConfirmGroupObjectPublic(__instance);
+        if (confirmGroup == null)
         {
+            return;
+        }
+
+        // Always restore Yes/No when we aren't replacing confirm (post-buy block, unique item, etc.).
+        if (!ShopConfirmListPatches.CanInterceptConfirmInputPublic()
+            || QuantityPicker.Instance == null)
+        {
+            ShopConfirmListPatches.RestoreConfirmChromePublic(confirmGroup.transform);
             return;
         }
 
         try
         {
             _inSetActiveHook = true;
-            GameObject? confirmGroup = n == "Item Confirm Group"
-                ? __instance
-                : ShopConfirmListPatches.FindConfirmGroupObjectPublic(__instance);
-            if (confirmGroup != null)
+            bool opened = ShopConfirmListPatches.TryOpenQtyForConfirmGroupPublic(
+                confirmGroup, reason: $"SetActive({n})");
+            if (opened && QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
             {
-                ShopConfirmListPatches.TryOpenQtyForConfirmGroupPublic(
-                    confirmGroup, reason: $"SetActive({n})");
-                // Hide Yes/No in the same frame as open (before Activate Yes No runs).
                 ShopConfirmListPatches.SuppressConfirmChromePublic(confirmGroup.transform);
+            }
+            else
+            {
+                ShopConfirmListPatches.RestoreConfirmChromePublic(confirmGroup.transform);
             }
         }
         catch (Exception ex)
@@ -138,9 +150,16 @@ internal static class ShopConfirmShowPatches
                 return;
             }
 
-            ShopConfirmListPatches.TryOpenQtyForConfirmGroupPublic(
+            bool opened = ShopConfirmListPatches.TryOpenQtyForConfirmGroupPublic(
                 confirmGroup, reason: "ActivateGameObject");
-            ShopConfirmListPatches.SuppressConfirmChromePublic(confirmGroup.transform);
+            if (opened && QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
+            {
+                ShopConfirmListPatches.SuppressConfirmChromePublic(confirmGroup.transform);
+            }
+            else
+            {
+                ShopConfirmListPatches.RestoreConfirmChromePublic(confirmGroup.transform);
+            }
         }
         catch (Exception ex)
         {
@@ -193,17 +212,25 @@ internal static class ShopConfirmShowPatches
 internal static class ShopConfirmListPatches
 {
     private static bool _pendingQtyOpen;
+    /// <summary>Bulk row remembered at UI CONFIRM — used when SetActive(Confirm) runs before FSM vars update.</summary>
+    private static ShopItemStats? _armedBulkStats;
 
-    internal static void ClearPendingQtyOpen() => _pendingQtyOpen = false;
+    internal static void ClearPendingQtyOpen()
+    {
+        _pendingQtyOpen = false;
+        _armedBulkStats = null;
+    }
 
     internal static bool CanInterceptConfirmInputPublic() => CanInterceptConfirmInput();
 
     internal static GameObject? FindConfirmGroupObjectPublic(GameObject go) => FindConfirmGroupObject(go);
 
-    internal static void TryOpenQtyForConfirmGroupPublic(GameObject confirmGroup, string reason) =>
+    internal static bool TryOpenQtyForConfirmGroupPublic(GameObject confirmGroup, string reason) =>
         TryOpenQtyForConfirmGroup(confirmGroup, reason);
 
     internal static void SuppressConfirmChromePublic(Transform root) => PreHideConfirmChrome(root);
+
+    internal static void RestoreConfirmChromePublic(Transform root) => RestoreConfirmChrome(root);
 
     internal static bool IsUnderShopConfirmPublic(Transform? t) => IsUnderShopConfirmTransform(t);
 
@@ -377,23 +404,31 @@ internal static class ShopConfirmListPatches
             ?? ResolveBulkStatsNear(__instance.gameObject)
             ?? ResolveBulkStatsNear(null);
 
-        if (stats == null || stats.Item == null)
+        if (stats == null || stats.Item == null || !Eligibility.ShouldOfferBulkQty(stats.Item))
         {
             return;
         }
 
-        __instance.gameObject.SetActive(false);
-        PreHideConfirmChrome(__instance.transform.root);
         MerchantStackerPlugin.Log.LogInfo(
             $"Confirm UI List SetActive → open qty: {stats.Item.DisplayName}");
-        OpenQtyForStats(stats, reason: "ConfirmList.SetActive", stockHint: stock);
+        if (OpenQtyForStats(stats, reason: "SetActive(UI List)", stockHint: stock)
+            && QuantityPicker.Instance != null
+            && QuantityPicker.Instance.IsOpen)
+        {
+            __instance.gameObject.SetActive(false);
+            PreHideConfirmChrome(__instance.transform.root);
+        }
     }
 
     [HarmonyPostfix]
     [HarmonyPatch(typeof(ShopMenuStock), "BuildItemList")]
     private static void BuildItemListPostfix(ShopMenuStock __instance)
     {
+        // ResetShopWindow rebuilds the list — clear post-buy block so qty can open again.
         PurchaseBatcher.EndShopPurchaseBlock();
+        ClearPendingQtyOpen();
+        RestoreConfirmChrome(__instance.transform.root);
+
         MerchantStackerPlugin.Log.LogInfo(
             $"Shop stock built: '{__instance.name}' items={__instance.GetItemCount()}");
     }
@@ -409,7 +444,7 @@ internal static class ShopConfirmListPatches
         if (eventName == "RESET SHOP WINDOW" || eventName == "RESET SHOP")
         {
             PurchaseBatcher.EndShopPurchaseBlock();
-            _pendingQtyOpen = false;
+            ClearPendingQtyOpen();
             ShopSelectionCache.Clear();
         }
 
@@ -437,8 +472,7 @@ internal static class ShopConfirmListPatches
             }
 
             if (stats != null && stats.Item != null
-                && Eligibility.IsBulkEligible(stats.Item)
-                && Eligibility.GetMaxQuantity(stats.Item) > 1
+                && Eligibility.ShouldOfferBulkQty(stats.Item)
                 && HasActiveConfirmGroup())
             {
                 MerchantStackerPlugin.Log.LogInfo(
@@ -455,55 +489,89 @@ internal static class ShopConfirmListPatches
             return true;
         }
 
-        // Opening confirm (Idle → UI CONFIRM, or subitem → TO CONFIRM).
-        // Qty opens when confirm chrome SetActive fires (after Can Buy); here we arm/schedule.
-        if (stats != null && stats.Item != null)
+        // UI CONFIRM is before Can Buy — never open or PreHide here.
+        // Arm the live bulk row so SetActive(Confirm) can open even if FSM vars lag.
+        if (eventName == "UI CONFIRM")
         {
+            ShopItemStats? current = ResolveCurrentShopStats(go);
+            if (current?.Item != null && Eligibility.ShouldOfferBulkQty(current.Item))
+            {
+                ShopSelectionCache.Remember(current);
+                _armedBulkStats = current;
+                MerchantStackerPlugin.Log.LogInfo(
+                    $"Fsm 'UI CONFIRM' → armed qty for {current.Item.DisplayName}");
+            }
+            else
+            {
+                _armedBulkStats = null;
+                _pendingQtyOpen = false;
+            }
+
+            return true;
+        }
+
+        // Sub-item path → confirm (after can-buy checks in that flow).
+        if (eventName == "TO CONFIRM" && stats != null && stats.Item != null
+            && Eligibility.ShouldOfferBulkQty(stats.Item))
+        {
+            _armedBulkStats = stats;
             MerchantStackerPlugin.Log.LogInfo(
                 $"Fsm '{eventName}' → arm qty for {stats.Item.DisplayName}");
-            PreHideConfirmChrome(go != null ? go.transform.root : stats.transform.root);
             OpenQtyForStats(stats, reason: eventName!);
-        }
-        else if (QuantityPicker.Instance != null && !_pendingQtyOpen)
-        {
-            MerchantStackerPlugin.Log.LogInfo(
-                $"Fsm '{eventName}' go={go?.name} — no bulk stats yet; wait for confirm");
-            _pendingQtyOpen = true;
-            QuantityPicker.Instance.StartCoroutine(WaitForConfirmThenOpen(go));
         }
 
         return true;
     }
 
-    private static void TryOpenQtyForConfirmGroup(GameObject confirmGroup, string reason)
+    private static bool TryOpenQtyForConfirmGroup(GameObject confirmGroup, string reason)
     {
         if (!CanInterceptConfirmInput() || QuantityPicker.Instance == null || QuantityPicker.Instance.IsOpen)
         {
-            return;
+            return QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen;
         }
 
-        PreHideConfirmChrome(confirmGroup.transform);
-
         ShopMenuStock? stock = confirmGroup.GetComponentInParent<ShopMenuStock>(true) ?? FindAnyShopStock();
-        ShopItemStats? stats = ResolveStatsFromStock(stock)
-            ?? ResolveBulkStatsNear(confirmGroup)
-            ?? ResolveBulkStatsNear(null);
+        // Live selection, then row armed at UI CONFIRM (not an unrelated stale cache).
+        ShopItemStats? current = ResolveCurrentShopStats(confirmGroup)
+            ?? ResolveStatsFromStock(stock)
+            ?? _armedBulkStats;
 
-        if (stats == null || stats.Item == null)
+        if (current?.Item != null)
         {
-            if (!_pendingQtyOpen)
+            ShopSelectionCache.Remember(current);
+        }
+
+        if (current == null || current.Item == null)
+        {
+            // Selection not readable this frame — retry if UI CONFIRM armed a bulk row.
+            if (!_pendingQtyOpen && _armedBulkStats != null && QuantityPicker.Instance != null)
             {
                 _pendingQtyOpen = true;
                 QuantityPicker.Instance.StartCoroutine(
                     RetryOpenFromConfirmGroup(confirmGroup, stock));
             }
 
-            return;
+            return false;
         }
 
+        if (!Eligibility.ShouldOfferBulkQty(current.Item))
+        {
+            _pendingQtyOpen = false;
+            _armedBulkStats = null;
+            return false;
+        }
+
+        // FSM already reached Confirm (Can Buy passed) — do not re-check CanBuy here.
+
         MerchantStackerPlugin.Log.LogInfo(
-            $"{reason} → open qty: {stats.Item.DisplayName}");
-        OpenQtyForStats(stats, reason: reason, stockHint: stock);
+            $"{reason} → open qty: {current.Item.DisplayName}");
+        bool opened = OpenQtyForStats(current, reason: reason, stockHint: stock);
+        if (opened)
+        {
+            _armedBulkStats = null;
+        }
+
+        return opened;
     }
 
     /// <summary>
@@ -574,12 +642,14 @@ internal static class ShopConfirmListPatches
 
     private static bool CanInterceptConfirmInput()
     {
+        // Do not gate on PendingQuantity — BeginSession used to set it to 1 and
+        // permanently blocked the next confirm open after a buy.
         return MerchantStackerPlugin.Enabled.Value
             && !PurchaseBatcher.IsBatching
             && !PurchaseBatcher.BlockShopPurchases
             && !PurchaseBatcher.ExpectingFsmPurchase
-            && PurchaseBatcher.PendingQuantity <= 0
-            && QuantityPicker.Instance != null;
+            && QuantityPicker.Instance != null
+            && !QuantityPicker.Instance.IsOpen;
     }
 
     private static bool OpenQtyForStats(ShopItemStats? stats, string reason, ShopMenuStock? stockHint = null)
@@ -596,9 +666,7 @@ internal static class ShopConfirmListPatches
         }
 
         ShopItem? item = stats.Item;
-        if (item == null
-            || !Eligibility.IsBulkEligible(item)
-            || Eligibility.GetMaxQuantity(item) <= 1)
+        if (item == null || !Eligibility.ShouldOfferBulkQty(item))
         {
             return false;
         }
@@ -624,45 +692,38 @@ internal static class ShopConfirmListPatches
             return false;
         }
 
-        Transform root = stock.transform.root;
-        PreHideConfirmChrome(root);
-        ShopSelectionCache.Remember(stats);
-
-        // UI CONFIRM fires before Can Buy — wait for confirm chrome (SetActive) unless already up.
-        // SetActive / Activate / TO CONFIRM / Yes steal → open immediately (skip Yes).
-        bool confirmVisible = FindActiveConfirmGroup(root) != null;
-        bool openNow = confirmVisible
-            || reason.StartsWith("SetActive", StringComparison.Ordinal)
+        // Never open on UI CONFIRM (before Can Buy) or because leftover confirm chrome is visible.
+        bool openNow = reason.StartsWith("SetActive", StringComparison.Ordinal)
             || reason.StartsWith("Activate", StringComparison.Ordinal)
             || reason.StartsWith("CallMethod", StringComparison.Ordinal)
             || reason == "TO CONFIRM"
             || reason == "UI SELECTION MADE"
             || reason == "YesSubmit"
             || reason == "immediate"
+            || reason == "ConfirmWait"
             || reason.IndexOf("retry", StringComparison.OrdinalIgnoreCase) >= 0;
 
-        if (openNow)
+        if (!openNow)
         {
-            _pendingQtyOpen = false;
-            OpenQtyReplacingConfirm(stock, stats);
-            if (QuantityPicker.Instance.IsOpen)
-            {
-                MerchantStackerPlugin.Log.LogInfo(
-                    $"Confirm → qty replace: {item.DisplayName} (via '{reason}')");
-                return true;
-            }
+            return false;
         }
 
-        if (_pendingQtyOpen)
+        ShopSelectionCache.Remember(stats);
+
+        _pendingQtyOpen = false;
+        // Open first — only hide Yes/No after qty owns the pad (avoids blank softlock).
+        OpenQtyReplacingConfirm(stock, stats);
+        if (QuantityPicker.Instance.IsOpen)
         {
+            PreHideConfirmChrome(stock.transform.root);
+            MerchantStackerPlugin.Log.LogInfo(
+                $"Confirm → qty replace: {item.DisplayName} (via '{reason}')");
             return true;
         }
 
-        _pendingQtyOpen = true;
-        QuantityPicker.Instance.StartCoroutine(OpenQtyAfterConfirmShows(stock, stats, reason));
-        MerchantStackerPlugin.Log.LogInfo(
-            $"Confirm → schedule qty replace: {item.DisplayName} (via '{reason}')");
-        return true;
+        MerchantStackerPlugin.Log.LogWarning(
+            $"Confirm qty: OpenInShop failed for {item.DisplayName} (via '{reason}') — left vanilla confirm");
+        return false;
     }
 
     private static IEnumerator OpenQtyAfterConfirmShows(ShopMenuStock stock, ShopItemStats stats, string reason)
@@ -779,7 +840,7 @@ internal static class ShopConfirmListPatches
 
     private static IEnumerator RetryOpenFromConfirmGroup(GameObject confirmGroup, ShopMenuStock? stock)
     {
-        for (int i = 0; i < 10; i++)
+        for (int i = 0; i < 12; i++)
         {
             yield return null;
             if (QuantityPicker.Instance == null || QuantityPicker.Instance.IsOpen)
@@ -791,16 +852,16 @@ internal static class ShopConfirmListPatches
             if (confirmGroup == null || !confirmGroup.activeInHierarchy)
             {
                 _pendingQtyOpen = false;
+                _armedBulkStats = null;
                 yield break;
             }
 
-            PreHideConfirmChrome(confirmGroup.transform);
             stock ??= confirmGroup.GetComponentInParent<ShopMenuStock>(true) ?? FindAnyShopStock();
-            ShopItemStats? stats = ResolveStatsFromStock(stock)
-                ?? ResolveBulkStatsNear(confirmGroup)
-                ?? ResolveBulkStatsNear(null);
+            ShopItemStats? stats = ResolveCurrentShopStats(confirmGroup)
+                ?? ResolveStatsFromStock(stock)
+                ?? _armedBulkStats;
 
-            if (stats == null || stats.Item == null)
+            if (stats == null || stats.Item == null || !Eligibility.ShouldOfferBulkQty(stats.Item))
             {
                 continue;
             }
@@ -808,11 +869,19 @@ internal static class ShopConfirmListPatches
             _pendingQtyOpen = false;
             MerchantStackerPlugin.Log.LogInfo(
                 $"Item Confirm Group retry → open qty: {stats.Item.DisplayName}");
-            OpenQtyForStats(stats, reason: "ItemConfirmGroup.retry", stockHint: stock);
-            yield break;
+            if (OpenQtyForStats(stats, reason: "ItemConfirmGroup.retry", stockHint: stock))
+            {
+                _armedBulkStats = null;
+                PreHideConfirmChrome(confirmGroup.transform);
+                yield break;
+            }
         }
 
         _pendingQtyOpen = false;
+        if (confirmGroup != null)
+        {
+            RestoreConfirmChrome(confirmGroup.transform);
+        }
     }
 
     private static void PreHideConfirmChrome(Transform root)
@@ -831,7 +900,9 @@ internal static class ShopConfirmListPatches
 
             string n = t.name;
             bool confirmUiList = n == "UI List" && t.parent != null && t.parent.name == "Confirm";
-            if (confirmUiList || n == "Confirm msg" || n == "Costs" || n == "Yes" || n == "No")
+            // Thankyou = vanilla "Item Purchased" leftover after a prior buy.
+            if (confirmUiList || n == "Confirm msg" || n == "Costs" || n == "Yes" || n == "No"
+                || n == "Thankyou")
             {
                 // Only kill Yes/No under the shop confirm list (not unrelated nodes).
                 if ((n == "Yes" || n == "No") && !IsUnderShopConfirmTransform(t))
@@ -840,6 +911,60 @@ internal static class ShopConfirmListPatches
                 }
 
                 t.gameObject.SetActive(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Re-enable Confirm + Yes/No/Costs. Qty PreHide leaves Confirm inactive — without
+    /// reactivating it, Yes/No stay invisible (blank softlock when max qty drops to 1).
+    /// </summary>
+    private static void RestoreConfirmChrome(Transform root)
+    {
+        if (root == null)
+        {
+            return;
+        }
+
+        foreach (Transform t in root.GetComponentsInChildren<Transform>(true))
+        {
+            if (t == null)
+            {
+                continue;
+            }
+
+            string n = t.name;
+
+            // Parent panel must be on or Yes/No never appear.
+            if (n == "Confirm"
+                && t.parent != null
+                && t.parent.name == "Item Confirm Group"
+                && !t.gameObject.activeSelf)
+            {
+                t.gameObject.SetActive(true);
+                continue;
+            }
+
+            bool confirmUiList = n == "UI List" && t.parent != null && t.parent.name == "Confirm";
+            if (!confirmUiList && n != "Confirm msg" && n != "Costs" && n != "Yes" && n != "No")
+            {
+                continue;
+            }
+
+            if ((n == "Yes" || n == "No") && !IsUnderShopConfirmTransform(t))
+            {
+                continue;
+            }
+
+            // Skip "Confirm msg" — leave Purchase Item? text off; Yes/No is enough.
+            if (n == "Confirm msg")
+            {
+                continue;
+            }
+
+            if (!t.gameObject.activeSelf)
+            {
+                t.gameObject.SetActive(true);
             }
         }
     }
@@ -904,31 +1029,41 @@ internal static class ShopConfirmListPatches
         return null;
     }
 
+    /// <summary>Live highlighted shop row from FSM/stock — ignores stale cache.</summary>
+    private static ShopItemStats? ResolveCurrentShopStats(GameObject? go)
+    {
+        ShopMenuStock? stock = FindShopStock(go) ?? FindAnyShopStock();
+        ShopItemStats? current = ResolveStatsFromStock(stock);
+        if (current == null && go != null)
+        {
+            current = ShopSelectionCache.GetStatsFromGameObject(go);
+        }
+
+        current ??= FindHighlightedBulk();
+        if (current == null || current.Item == null)
+        {
+            return null;
+        }
+
+        return current;
+    }
+
     private static ShopItemStats? ResolveBulkStatsNear(GameObject? go)
     {
-        ShopItemStats? stats = null;
-        if (go != null)
+        // Prefer live selection. Only accept cache if it matches that row.
+        ShopItemStats? current = ResolveCurrentShopStats(go);
+        if (current?.Item != null)
         {
-            stats = ShopSelectionCache.GetStatsFromGameObject(go)
-                ?? ResolveStatsFromStock(FindShopStock(go));
+            ShopSelectionCache.Remember(current);
+            if (!Eligibility.ShouldOfferBulkQty(current.Item))
+            {
+                return null;
+            }
+
+            return current;
         }
 
-        stats ??= ShopSelectionCache.ResolveStats()
-            ?? ResolveStatsFromStock(FindAnyShopStock())
-            ?? FindHighlightedBulk();
-
-        // Unity destroyed-object check before touching .Item / GetComponent.
-        if (stats == null || stats.Item == null)
-        {
-            return null;
-        }
-
-        if (!Eligibility.IsBulkEligible(stats.Item) || Eligibility.GetMaxQuantity(stats.Item) <= 1)
-        {
-            return null;
-        }
-
-        return stats;
+        return null;
     }
 
     private static ShopItemStats? ResolveStatsFromStock(ShopMenuStock? stock)
@@ -1111,9 +1246,7 @@ internal static class ShopConfirmListPatches
             }
 
             var stats = ShopSelectionCache.GetStatsFromGameObject(manager.CurrentSelected.gameObject);
-            if (stats?.Item != null
-                && Eligibility.IsBulkEligible(stats.Item)
-                && Eligibility.GetMaxQuantity(stats.Item) > 1)
+            if (stats?.Item != null && Eligibility.ShouldOfferBulkQty(stats.Item))
             {
                 return stats;
             }

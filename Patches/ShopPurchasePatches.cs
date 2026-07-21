@@ -133,7 +133,7 @@ internal static class ShopPurchasePatches
         }
 
         // Bulk item reached purchase without qty UI — open qty; buy path will ResetShopWindow.
-        if (Eligibility.IsBulkEligible(stats.Item) && Eligibility.GetMaxQuantity(stats.Item) > 1)
+        if (Eligibility.ShouldOfferBulkQty(stats.Item))
         {
             setWaiting(true);
             if (ShopConfirmListPatches.TryOpenQtyImmediate(stats))

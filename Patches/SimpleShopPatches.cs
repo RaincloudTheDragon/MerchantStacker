@@ -68,13 +68,15 @@ internal static class SimpleShopPatches
             return true;
         }
 
-        if (!TryExtractShopItem(item, out ShopItem? shopItem) || shopItem == null || !Eligibility.IsBulkEligible(shopItem))
+        if (!TryExtractShopItem(item, out ShopItem? shopItem)
+            || shopItem == null
+            || !Eligibility.ShouldOfferBulkQty(shopItem))
         {
             return true;
         }
 
         int maxQty = Eligibility.GetMaxQuantity(shopItem);
-        if (maxQty <= 1)
+        if (maxQty < 1)
         {
             return true;
         }

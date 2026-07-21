@@ -31,16 +31,29 @@ internal static class Eligibility
         return collectable.CanGetMore() && !collectable.IsAtMax();
     }
 
+    /// <summary>
+    /// True when we should replace Yes/No with qty (stackable + can buy at least one).
+    /// </summary>
+    public static bool ShouldOfferBulkQty(ShopItem? item)
+    {
+        if (!IsBulkEligible(item) || item == null)
+        {
+            return false;
+        }
+
+        return GetMaxQuantity(item) >= 1;
+    }
+
     public static int GetMaxQuantity(ShopItem item)
     {
         if (item.Item is not CollectableItem collectable)
         {
-            return 1;
+            return 0;
         }
 
         int room = GetRoomUntilCap(collectable);
         int affordable = GetAffordableCount(item);
-        return System.Math.Max(1, System.Math.Min(room, affordable));
+        return System.Math.Max(0, System.Math.Min(room, affordable));
     }
 
     public static int GetRoomUntilCap(CollectableItem item)

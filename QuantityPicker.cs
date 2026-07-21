@@ -173,7 +173,7 @@ internal sealed class QuantityPicker : MonoBehaviour
         int maxQuantity,
         ShopItemStats stats)
     {
-        if (!MerchantStackerPlugin.Enabled.Value || maxQuantity <= 1 || _active || stats?.Item == null)
+        if (!MerchantStackerPlugin.Enabled.Value || maxQuantity < 1 || _active || stats?.Item == null)
         {
             return;
         }
@@ -186,10 +186,23 @@ internal sealed class QuantityPicker : MonoBehaviour
         _onCancel = null;
         BindShopCostText(stats);
         BuildConfirmQtyHud();
+        if (_hudRoot == null)
+        {
+            // Never leave IsOpen with no HUD — that PreHides Yes/No forever.
+            MerchantStackerPlugin.Log.LogWarning("OpenInShop: HUD failed — restoring vanilla confirm");
+            _active = false;
+            _inShop = false;
+            _shopRoot = null;
+            _shopStats = null;
+            InventoryPaneInput.IsInputBlocked = false;
+            Patches.ShopConfirmListPatches.RestoreConfirmChromePublic(shopRoot.root);
+            return;
+        }
+
         RefreshInShopHud();
         StartCoroutine(EnsureHudSoon());
         MerchantStackerPlugin.Log.LogInfo(
-            $"In-shop qty: {_title} max={_max} cost={_unitCost} hud={(_hudRoot != null)}");
+            $"In-shop qty: {_title} max={_max} cost={_unitCost} hud=True");
     }
 
     /// <summary>Wire shop FSM wait/complete + cancel (reset window, no extra purchase).</summary>
@@ -208,6 +221,8 @@ internal sealed class QuantityPicker : MonoBehaviour
 
         // FSM "Activate Yes No" re-enables chrome after we open — keep it dead every frame.
         SuppressInShopConfirmChrome();
+        // Cancel/re-enter can leave Item Sprite inactive or renderer disabled — keep art up.
+        EnsureConfirmItemArtVisible();
 
         // Only abort when the whole shop menu is gone.
         // Do NOT check ShopItemStats.activeInHierarchy — list rows are often disabled
@@ -222,29 +237,99 @@ internal sealed class QuantityPicker : MonoBehaviour
     /// <summary>Keep vanilla Yes/No/Costs off while qty replaces confirm.</summary>
     private void SuppressInShopConfirmChrome()
     {
-        Transform? root = null;
-        try
-        {
-            if (_shopStats != null)
-            {
-                root = _shopStats.transform.root;
-            }
-            else if (_shopRoot != null)
-            {
-                root = _shopRoot.root;
-            }
-        }
-        catch
-        {
-            return;
-        }
-
+        Transform? root = GetShopMenuRoot();
         if (root == null)
         {
             return;
         }
 
         Patches.ShopConfirmListPatches.SuppressConfirmChromePublic(root);
+    }
+
+    private Transform? GetShopMenuRoot()
+    {
+        try
+        {
+            if (_shopStats != null)
+            {
+                return _shopStats.transform.root;
+            }
+
+            if (_shopRoot != null)
+            {
+                return _shopRoot.root;
+            }
+        }
+        catch
+        {
+            // ignored
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Keep confirm item name + logo visible. After cancel, FSM may leave Item Sprite off.
+    /// </summary>
+    private void EnsureConfirmItemArtVisible()
+    {
+        Transform? root = GetShopMenuRoot();
+        if (root == null)
+        {
+            return;
+        }
+
+        Transform? group = FindNamedTransform(root, "Item Confirm Group");
+        if (group == null)
+        {
+            return;
+        }
+
+        if (!group.gameObject.activeSelf)
+        {
+            group.gameObject.SetActive(true);
+        }
+
+        foreach (Transform t in group.GetComponentsInChildren<Transform>(true))
+        {
+            if (t == null || (t.name != "Item Sprite" && t.name != "Item name"))
+            {
+                continue;
+            }
+
+            // Only the confirm hero art (direct under Item Confirm Group), not Costs/Item Sprite.
+            if (t.parent != group)
+            {
+                continue;
+            }
+
+            if (!t.gameObject.activeSelf)
+            {
+                t.gameObject.SetActive(true);
+            }
+
+            var sr = t.GetComponent<SpriteRenderer>();
+            if (sr != null)
+            {
+                sr.enabled = true;
+                Color c = sr.color;
+                if (c.a < 1f)
+                {
+                    c.a = 1f;
+                    sr.color = c;
+                }
+            }
+
+            var tmp = t.GetComponent<TextMeshPro>();
+            if (tmp != null)
+            {
+                var mr = tmp.GetComponent<MeshRenderer>();
+                if (mr != null)
+                {
+                    mr.enabled = true;
+                }
+            }
+        }
     }
 
     /// <summary>Force-close qty without purchasing (shop closed or lost).</summary>
@@ -291,7 +376,7 @@ internal sealed class QuantityPicker : MonoBehaviour
         Action? originalYes,
         Action? originalNo)
     {
-        if (!MerchantStackerPlugin.Enabled.Value || maxQuantity <= 1 || _active)
+        if (!MerchantStackerPlugin.Enabled.Value || maxQuantity < 1 || _active)
         {
             return;
         }
@@ -388,7 +473,7 @@ internal sealed class QuantityPicker : MonoBehaviour
         _shopStats = null;
         // Keep ArmShopPurchaseSession callbacks — OpenInShop is called after Arm.
         _active = true;
-        PurchaseBatcher.PendingQuantity = 1;
+        // PendingQuantity is set only on Finish(confirmed) — not here (blocked next open).
         ResetHoldState();
         InventoryPaneInput.IsInputBlocked = true;
     }
@@ -450,10 +535,11 @@ internal sealed class QuantityPicker : MonoBehaviour
 
             Transform layoutParent = confirmGroup != null ? confirmGroup : confirm;
             DumpConfirmGroup(layoutParent);
+            EnsureConfirmItemArtVisible();
             HideConfirmChrome(confirm, confirmGroup);
             HideNativeConfirmCosts(confirm);
 
-            // Parent to this DontDestroyOnLoad picker — never under shop (prevents stuck overlays).
+            // Qty/cost stay on DontDestroyOnLoad (avoids stuck TMP overlays).
             _hudRoot = new GameObject("MerchantStacker_QtyHud");
             _hudRoot.layer = layoutParent.gameObject.layer;
             _hudRoot.transform.SetParent(transform, false);
@@ -461,7 +547,8 @@ internal sealed class QuantityPicker : MonoBehaviour
             _hudRoot.transform.localRotation = Quaternion.identity;
             _hudRoot.transform.localScale = Vector3.one;
 
-            GetQtyColumnWorld(layoutParent, out Vector3 qtyWorld, out Vector3 upWorld, out Vector3 downWorld);
+            GetQtyColumnWorld(layoutParent, out Vector3 qtyWorld, out _, out _);
+            GetQtyColumnLocal(layoutParent, out Vector3 qtyLocal, out Vector3 upLocal, out Vector3 downLocal);
             Vector3 currencyWorld = qtyWorld + layoutParent.TransformVector(new Vector3(1.5f, 0f, 0f));
             Vector3 costWorld = qtyWorld + layoutParent.TransformVector(new Vector3(2.4f, 0f, 0f));
 
@@ -485,9 +572,10 @@ internal sealed class QuantityPicker : MonoBehaviour
                 }
             }
 
-            if (TryCreateVerticalArrowsWorld(confirm, upWorld, downWorld))
+            // tk2d Pointers only render in confirm local space (db1c770) — not world/DDOL.
+            if (TryCreateVerticalArrowsLocal(confirm, layoutParent, upLocal, downLocal))
             {
-                MerchantStackerPlugin.Log.LogInfo("Qty HUD arrows: vertical (pointer/small)");
+                MerchantStackerPlugin.Log.LogInfo("Qty HUD arrows: local (pointer/small)");
             }
             else
             {
@@ -495,7 +583,7 @@ internal sealed class QuantityPicker : MonoBehaviour
             }
 
             MerchantStackerPlugin.Log.LogInfo(
-                $"Qty HUD world qty={qtyWorld} arrows={(_hudArrowUp != null)} currency={(_hudCurrencyIcon != null)}");
+                $"Qty HUD world qty={qtyWorld} local={qtyLocal} arrows={(_hudArrowUp != null)} currency={(_hudCurrencyIcon != null)}");
         }
         catch (Exception ex)
         {
@@ -544,30 +632,56 @@ internal sealed class QuantityPicker : MonoBehaviour
         out Vector3 upWorld,
         out Vector3 downWorld)
     {
-        Transform? item = FindNamedTransform(layoutParent, "Item Sprite");
-        if (item != null)
-        {
-            Vector3 right = layoutParent.TransformVector(new Vector3(2.55f, 0f, 0f));
-            Vector3 up = layoutParent.TransformVector(new Vector3(0f, 1.05f, 0f));
-            qtyWorld = item.position + right;
-            upWorld = qtyWorld + up;
-            downWorld = qtyWorld - up;
-            return;
-        }
-
-        qtyWorld = layoutParent.TransformPoint(new Vector3(-0.89f, 1.52f, -3f));
-        upWorld = layoutParent.TransformPoint(new Vector3(-0.89f, 2.57f, -3f));
-        downWorld = layoutParent.TransformPoint(new Vector3(-0.89f, 0.47f, -3f));
+        GetQtyColumnLocal(layoutParent, out Vector3 qtyLocal, out Vector3 upLocal, out Vector3 downLocal);
+        qtyWorld = layoutParent.TransformPoint(qtyLocal);
+        upWorld = layoutParent.TransformPoint(upLocal);
+        downWorld = layoutParent.TransformPoint(downLocal);
     }
 
-    private bool TryCreateVerticalArrowsWorld(Transform confirm, Vector3 upWorld, Vector3 downWorld)
+    /// <summary>Confirm-group local qty column (same plane as Item Sprite, z≈-3).</summary>
+    private static void GetQtyColumnLocal(
+        Transform layoutParent,
+        out Vector3 qtyLocal,
+        out Vector3 upLocal,
+        out Vector3 downLocal)
     {
-        Transform? pointer = FindNamedTransform(confirm, "Pointer L");
+        Transform? item = FindNamedTransform(layoutParent, "Item Sprite");
+        Vector3 itemLp = item != null ? item.localPosition : new Vector3(-3.4f, 1.5f, -3f);
+        // Prefer Item Sprite under Item Confirm Group (not nested Costs sprites).
+        if (item != null && item.parent != layoutParent)
+        {
+            foreach (Transform t in layoutParent.GetComponentsInChildren<Transform>(true))
+            {
+                if (t != null && t.name == "Item Sprite" && t.parent == layoutParent)
+                {
+                    itemLp = t.localPosition;
+                    break;
+                }
+            }
+        }
+
+        float z = itemLp.z;
+        qtyLocal = new Vector3(itemLp.x + 2.55f, itemLp.y, z);
+        upLocal = new Vector3(qtyLocal.x, qtyLocal.y + 1.05f, z);
+        downLocal = new Vector3(qtyLocal.x, qtyLocal.y - 1.05f, z);
+    }
+
+    /// <summary>
+    /// Pointer carets in confirm local space (db1c770). World/DDOL clones stay invisible.
+    /// </summary>
+    private bool TryCreateVerticalArrowsLocal(
+        Transform confirm,
+        Transform layoutParent,
+        Vector3 upLocal,
+        Vector3 downLocal)
+    {
+        Transform? pointer = FindNamedTransform(confirm, "Pointer L")
+            ?? FindNamedTransform(layoutParent, "Pointer L");
         if (pointer != null)
         {
-            _hudArrowUp = CloneArrowWorld(pointer.gameObject, _hudRoot!.transform, "ArrowUp", upWorld, 90f, 0.75f);
-            _hudArrowDown = CloneArrowWorld(pointer.gameObject, _hudRoot.transform, "ArrowDown", downWorld, -90f, 0.75f);
-            MerchantStackerPlugin.Log.LogInfo("Arrows from Confirm Pointer L (rotated vertical)");
+            _hudArrowUp = CloneArrowLocal(pointer.gameObject, layoutParent, "ArrowUp", upLocal, 90f, 0.75f);
+            _hudArrowDown = CloneArrowLocal(pointer.gameObject, layoutParent, "ArrowDown", downLocal, -90f, 0.75f);
+            MerchantStackerPlugin.Log.LogInfo("Arrows from Confirm Pointer L (local vertical)");
             return true;
         }
 
@@ -585,9 +699,9 @@ internal sealed class QuantityPicker : MonoBehaviour
                 continue;
             }
 
-            _hudArrowUp = CloneArrowWorld(u.gameObject, _hudRoot!.transform, "ArrowUp", upWorld, 0f, 0.85f);
-            _hudArrowDown = CloneArrowWorld(d.gameObject, _hudRoot.transform, "ArrowDown", downWorld, 0f, 0.85f);
-            MerchantStackerPlugin.Log.LogInfo("Arrows from SimpleShopMenu up/down");
+            _hudArrowUp = CloneArrowLocal(u.gameObject, layoutParent, "ArrowUp", upLocal, 0f, 0.85f);
+            _hudArrowDown = CloneArrowLocal(d.gameObject, layoutParent, "ArrowDown", downLocal, 0f, 0.85f);
+            MerchantStackerPlugin.Log.LogInfo("Arrows from SimpleShopMenu up/down (local)");
             return true;
         }
 
@@ -612,19 +726,20 @@ internal sealed class QuantityPicker : MonoBehaviour
         return false;
     }
 
-    private static GameObject CloneArrowWorld(
+    private static GameObject CloneArrowLocal(
         GameObject template,
-        Transform parent,
+        Transform layoutParent,
         string name,
-        Vector3 worldPos,
+        Vector3 localPos,
         float rotationZ,
         float scale)
     {
-        var go = UnityEngine.Object.Instantiate(template, parent);
+        var go = UnityEngine.Object.Instantiate(template, layoutParent);
         go.name = name;
+        go.layer = layoutParent.gameObject.layer;
         go.SetActive(true);
-        go.transform.position = worldPos;
-        go.transform.rotation = Quaternion.Euler(0f, 0f, rotationZ);
+        go.transform.localPosition = localPos;
+        go.transform.localRotation = Quaternion.Euler(0f, 0f, rotationZ);
         go.transform.localScale = Vector3.one * scale;
 
         go.GetComponent<InvAnimateUpAndDown>()?.Show();
@@ -946,9 +1061,10 @@ internal sealed class QuantityPicker : MonoBehaviour
     }
 
     /// <summary>
-    /// Deactivate Item Confirm Group after cancel so half-hidden Yes/No/Costs can't linger.
+    /// On cancel: restore Yes/No activeSelf, then hide the whole confirm group.
+    /// Leaving Yes/No inactive under the group caused a blank softlock on re-enter.
     /// </summary>
-    private static void ForceHideItemConfirmGroup(ShopItemStats? stats)
+    private static void ForceHideConfirmChromeOnly(ShopItemStats? stats)
     {
         Transform? root = null;
         try
@@ -983,6 +1099,8 @@ internal sealed class QuantityPicker : MonoBehaviour
             return;
         }
 
+        // Children keep activeSelf across parent toggle — re-enable before hiding group.
+        Patches.ShopConfirmListPatches.RestoreConfirmChromePublic(root);
         foreach (Transform t in root.GetComponentsInChildren<Transform>(true))
         {
             if (t != null && t.name == "Item Confirm Group" && t.gameObject.activeSelf)
@@ -1010,6 +1128,17 @@ internal sealed class QuantityPicker : MonoBehaviour
         // Wipe our TMP meshes before destroy so world-space digits can't linger.
         ClearTmpVisual(_hudQty);
         ClearTmpVisual(_hudCost);
+
+        // Arrows live under Item Confirm Group (not _hudRoot).
+        if (_hudArrowUp != null)
+        {
+            UnityEngine.Object.DestroyImmediate(_hudArrowUp);
+        }
+
+        if (_hudArrowDown != null)
+        {
+            UnityEngine.Object.DestroyImmediate(_hudArrowDown);
+        }
 
         if (_hudRoot != null)
         {
@@ -1135,7 +1264,9 @@ internal sealed class QuantityPicker : MonoBehaviour
                 bool ours = go.name == "MerchantStacker_QtyHud"
                     || (go.transform.parent != null
                         && (go.transform.parent.name == "MerchantStacker_QtyHud"
-                            || go.transform.parent.name == "MerchantStacker_QuantityPicker"));
+                            || go.transform.parent.name == "MerchantStacker_QuantityPicker"
+                            || ((go.name == "ArrowUp" || go.name == "ArrowDown")
+                                && go.transform.parent.name == "Item Confirm Group")));
                 if (!ours)
                 {
                     continue;
@@ -1221,9 +1352,13 @@ internal sealed class QuantityPicker : MonoBehaviour
                 stock?.SetWasItemPurchased(true);
                 ShowPurchaseFeedback(shopStats);
                 ScrubLeftoverQtyHud();
+                ForceHideConfirmChromeOnly(shopStats);
                 // Clear any SetShopItemPurchased wait, then hard-reset to the item list.
                 purchaseDone?.Invoke();
                 EventRegister.SendEvent(EventRegisterEvents.ResetShopWindow);
+                // BlockShopPurchases was set during Buy — must clear or next confirm softlocks.
+                PurchaseBatcher.EndShopPurchaseBlock();
+                Patches.ShopConfirmListPatches.ClearPendingQtyOpen();
                 GameCameras.instance?.HUDIn();
                 MerchantStackerPlugin.Log.LogInfo("Bulk buy done → popup + ResetShopWindow");
             });
@@ -1282,7 +1417,7 @@ internal sealed class QuantityPicker : MonoBehaviour
         // Cancel: scrub our HUD and force-hide confirm chrome. Do not re-enable Yes/No/Costs
         // (that left unit-price overlays). ResetShopWindow rebuilds a clean item list.
         DestroyInShopHud(restoreTexts: true, restoreConfirmChrome: false);
-        ForceHideItemConfirmGroup(shopStats);
+        ForceHideConfirmChromeOnly(shopStats);
         ClearPickerHudChildren();
         ResetHoldState();
         InventoryPaneInput.IsInputBlocked = false;
@@ -1310,11 +1445,12 @@ internal sealed class QuantityPicker : MonoBehaviour
             {
                 ScrubLeftoverQtyHud();
                 ClearPickerHudChildren();
-                ForceHideItemConfirmGroup(shopStats);
+                ForceHideConfirmChromeOnly(shopStats);
+                ShopSelectionCache.Clear();
+                Patches.ShopConfirmListPatches.ClearPendingQtyOpen();
                 shopCancel?.Invoke();
                 ScrubLeftoverQtyHud();
                 ClearPickerHudChildren();
-                ForceHideItemConfirmGroup(shopStats);
                 MerchantStackerPlugin.Log.LogInfo("Qty cancelled → ResetShopWindow");
             }
 

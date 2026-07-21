@@ -53,9 +53,7 @@ internal static class ConfirmDialogPatches
             }
 
             ShopItemStats? stats = ShopSelectionCache.ResolveStats();
-            if (stats?.Item == null
-                || !Eligibility.IsBulkEligible(stats.Item)
-                || Eligibility.GetMaxQuantity(stats.Item) <= 1)
+            if (stats?.Item == null || !Eligibility.ShouldOfferBulkQty(stats.Item))
             {
                 return;
             }
