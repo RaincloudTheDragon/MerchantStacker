@@ -46,6 +46,8 @@ public class MerchantStackerPlugin : BaseUnityPlugin
 
         _harmony = new Harmony(PluginGuid);
         TryPatch(typeof(ShopSelectionCachePatches));
+        // Show hooks first / separate — must not die if an event patch fails.
+        TryPatch(typeof(ShopConfirmShowPatches));
         TryPatch(typeof(ShopConfirmListPatches));
         TryPatch(typeof(ConfirmDialogPatches));
         TryPatch(typeof(InventoryPaneInputPatches));

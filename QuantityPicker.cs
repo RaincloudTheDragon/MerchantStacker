@@ -206,6 +206,9 @@ internal sealed class QuantityPicker : MonoBehaviour
             return;
         }
 
+        // FSM "Activate Yes No" re-enables chrome after we open — keep it dead every frame.
+        SuppressInShopConfirmChrome();
+
         // Only abort when the whole shop menu is gone.
         // Do NOT check ShopItemStats.activeInHierarchy — list rows are often disabled
         // while Item Confirm Group is up (that was aborting qty every frame).
@@ -214,6 +217,34 @@ internal sealed class QuantityPicker : MonoBehaviour
         {
             AbortInShopSession(resetShopWindow: true);
         }
+    }
+
+    /// <summary>Keep vanilla Yes/No/Costs off while qty replaces confirm.</summary>
+    private void SuppressInShopConfirmChrome()
+    {
+        Transform? root = null;
+        try
+        {
+            if (_shopStats != null)
+            {
+                root = _shopStats.transform.root;
+            }
+            else if (_shopRoot != null)
+            {
+                root = _shopRoot.root;
+            }
+        }
+        catch
+        {
+            return;
+        }
+
+        if (root == null)
+        {
+            return;
+        }
+
+        Patches.ShopConfirmListPatches.SuppressConfirmChromePublic(root);
     }
 
     /// <summary>Force-close qty without purchasing (shop closed or lost).</summary>
@@ -616,21 +647,29 @@ internal sealed class QuantityPicker : MonoBehaviour
     /// <summary>Disable Yes/No list and selection cursors so they don't sit on the qty digits.</summary>
     private void HideConfirmChrome(Transform confirm, Transform? confirmGroup)
     {
+        Transform searchRoot = confirmGroup != null ? confirmGroup : confirm;
+        Patches.ShopConfirmListPatches.SuppressConfirmChromePublic(searchRoot);
+
         Transform? uiList = confirm.Find("UI List");
-        if (uiList != null && uiList.gameObject.activeSelf)
+        if (uiList != null)
         {
             _hiddenConfirmList = uiList.gameObject;
-            _hiddenConfirmList.SetActive(false);
+            if (uiList.gameObject.activeSelf)
+            {
+                uiList.gameObject.SetActive(false);
+            }
         }
 
         Transform? msg = FindNamedTransform(confirm, "Confirm msg");
-        if (msg != null && msg.gameObject.activeSelf)
+        if (msg != null)
         {
             _hiddenConfirmMsg = msg.gameObject;
-            _hiddenConfirmMsg.SetActive(false);
+            if (msg.gameObject.activeSelf)
+            {
+                msg.gameObject.SetActive(false);
+            }
         }
 
-        Transform searchRoot = confirmGroup != null ? confirmGroup : confirm;
         foreach (Transform t in searchRoot.GetComponentsInChildren<Transform>(true))
         {
             if (t == null)
@@ -904,6 +943,53 @@ internal sealed class QuantityPicker : MonoBehaviour
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Deactivate Item Confirm Group after cancel so half-hidden Yes/No/Costs can't linger.
+    /// </summary>
+    private static void ForceHideItemConfirmGroup(ShopItemStats? stats)
+    {
+        Transform? root = null;
+        try
+        {
+            if (stats != null)
+            {
+                root = stats.transform.root;
+            }
+        }
+        catch
+        {
+            root = null;
+        }
+
+        if (root == null)
+        {
+            foreach (ShopMenuStock stock in UnityEngine.Object.FindObjectsByType<ShopMenuStock>(
+                         FindObjectsInactive.Include, FindObjectsSortMode.None))
+            {
+                if (stock == null || !stock.gameObject.scene.IsValid())
+                {
+                    continue;
+                }
+
+                root = stock.transform.root;
+                break;
+            }
+        }
+
+        if (root == null)
+        {
+            return;
+        }
+
+        foreach (Transform t in root.GetComponentsInChildren<Transform>(true))
+        {
+            if (t != null && t.name == "Item Confirm Group" && t.gameObject.activeSelf)
+            {
+                t.gameObject.SetActive(false);
+            }
+        }
     }
 
     private void DestroyInShopHud(bool restoreTexts, bool restoreConfirmChrome = true)
@@ -1193,11 +1279,14 @@ internal sealed class QuantityPicker : MonoBehaviour
         _shopCancel = null;
         _item = null;
 
-        // Never restore Yes/No/Costs on cancel — that left unit-price overlays after ResetShopWindow.
+        // Cancel: scrub our HUD and force-hide confirm chrome. Do not re-enable Yes/No/Costs
+        // (that left unit-price overlays). ResetShopWindow rebuilds a clean item list.
         DestroyInShopHud(restoreTexts: true, restoreConfirmChrome: false);
+        ForceHideItemConfirmGroup(shopStats);
         ClearPickerHudChildren();
         ResetHoldState();
         InventoryPaneInput.IsInputBlocked = false;
+        Patches.ShopConfirmListPatches.ClearPendingQtyOpen();
 
         if (confirmed)
         {
@@ -1208,6 +1297,7 @@ internal sealed class QuantityPicker : MonoBehaviour
         {
             PurchaseBatcher.ClearPendingQuantity();
             PurchaseBatcher.ExpectingFsmPurchase = false;
+            PurchaseBatcher.EndShopPurchaseBlock();
         }
 
         if (inShop)
@@ -1220,9 +1310,11 @@ internal sealed class QuantityPicker : MonoBehaviour
             {
                 ScrubLeftoverQtyHud();
                 ClearPickerHudChildren();
+                ForceHideItemConfirmGroup(shopStats);
                 shopCancel?.Invoke();
                 ScrubLeftoverQtyHud();
                 ClearPickerHudChildren();
+                ForceHideItemConfirmGroup(shopStats);
                 MerchantStackerPlugin.Log.LogInfo("Qty cancelled → ResetShopWindow");
             }
 

@@ -9,12 +9,203 @@ using UnityEngine;
 namespace MerchantStacker.Patches;
 
 /// <summary>
+/// Show-confirm intercepts (separate class so a bad event patch can't disable these).
+/// PlayMaker ActivateGameObject ends in GameObject.SetActive(true).
+/// </summary>
+[HarmonyPatch]
+internal static class ShopConfirmShowPatches
+{
+    private static bool _inSetActiveHook;
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(GameObject), nameof(GameObject.SetActive))]
+    private static void GameObjectSetActivePostfix(GameObject __instance, bool value)
+    {
+        if (!value || _inSetActiveHook || __instance == null)
+        {
+            return;
+        }
+
+        string n = __instance.name;
+        if (n != "Item Confirm Group" && n != "Confirm" && n != "UI List"
+            && n != "Yes" && n != "No" && n != "Confirm msg" && n != "Costs")
+        {
+            return;
+        }
+
+        bool underConfirmUiList = n == "UI List"
+            && __instance.transform.parent != null
+            && __instance.transform.parent.name == "Confirm";
+        bool underConfirmChrome = underConfirmUiList
+            || n == "Confirm msg"
+            || n == "Costs"
+            || ((n == "Yes" || n == "No")
+                && ShopConfirmListPatches.IsUnderShopConfirmPublic(__instance.transform));
+
+        if (n == "UI List" && !underConfirmUiList)
+        {
+            return;
+        }
+
+        // Qty already owns the pad — FSM "Activate Yes No" re-enables chrome after we open.
+        // Kill Yes/No/Costs immediately so left-stick can't drive vanilla confirm.
+        if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen
+            && (underConfirmChrome || n == "Confirm" || n == "Item Confirm Group"))
+        {
+            if (underConfirmChrome || n == "UI List" || n == "Confirm msg" || n == "Costs"
+                || n == "Yes" || n == "No")
+            {
+                try
+                {
+                    _inSetActiveHook = true;
+                    __instance.SetActive(false);
+                }
+                finally
+                {
+                    _inSetActiveHook = false;
+                }
+            }
+
+            if (n == "Confirm" || n == "Item Confirm Group")
+            {
+                ShopConfirmListPatches.SuppressConfirmChromePublic(__instance.transform);
+            }
+
+            return;
+        }
+
+        if (!ShopConfirmListPatches.CanInterceptConfirmInputPublic()
+            || QuantityPicker.Instance == null)
+        {
+            return;
+        }
+
+        if (__instance.transform.root.GetComponentInChildren<ShopMenuStock>(true) == null)
+        {
+            return;
+        }
+
+        try
+        {
+            _inSetActiveHook = true;
+            GameObject? confirmGroup = n == "Item Confirm Group"
+                ? __instance
+                : ShopConfirmListPatches.FindConfirmGroupObjectPublic(__instance);
+            if (confirmGroup != null)
+            {
+                ShopConfirmListPatches.TryOpenQtyForConfirmGroupPublic(
+                    confirmGroup, reason: $"SetActive({n})");
+                // Hide Yes/No in the same frame as open (before Activate Yes No runs).
+                ShopConfirmListPatches.SuppressConfirmChromePublic(confirmGroup.transform);
+            }
+        }
+        catch (Exception ex)
+        {
+            MerchantStackerPlugin.Log.LogWarning($"SetActive confirm hook: {ex.Message}");
+        }
+        finally
+        {
+            _inSetActiveHook = false;
+        }
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(ActivateGameObject), nameof(ActivateGameObject.OnEnter))]
+    private static void ActivateGameObjectPostfix(ActivateGameObject __instance)
+    {
+        try
+        {
+            if (__instance.activate == null || !__instance.activate.Value || __instance.Fsm == null)
+            {
+                return;
+            }
+
+            GameObject? go = __instance.Fsm.GetOwnerDefaultTarget(__instance.gameObject);
+            if (go == null)
+            {
+                return;
+            }
+
+            GameObject? confirmGroup = ShopConfirmListPatches.FindConfirmGroupObjectPublic(go);
+            if (confirmGroup == null)
+            {
+                return;
+            }
+
+            if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
+            {
+                ShopConfirmListPatches.SuppressConfirmChromePublic(confirmGroup.transform);
+                return;
+            }
+
+            ShopConfirmListPatches.TryOpenQtyForConfirmGroupPublic(
+                confirmGroup, reason: "ActivateGameObject");
+            ShopConfirmListPatches.SuppressConfirmChromePublic(confirmGroup.transform);
+        }
+        catch (Exception ex)
+        {
+            MerchantStackerPlugin.Log.LogWarning($"ActivateGameObject hook: {ex.Message}");
+        }
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(CallMethodProper), nameof(CallMethodProper.OnEnter))]
+    private static void CallMethodProperPostfix(CallMethodProper __instance)
+    {
+        try
+        {
+            if (__instance.methodName == null || __instance.Fsm == null)
+            {
+                return;
+            }
+
+            if (!string.Equals(__instance.methodName.Value, "SetActive", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            GameObject? go = __instance.Fsm.GetOwnerDefaultTarget(__instance.gameObject);
+            if (go == null)
+            {
+                return;
+            }
+
+            GameObject? confirmGroup = ShopConfirmListPatches.FindConfirmGroupObjectPublic(go);
+            if (confirmGroup == null)
+            {
+                return;
+            }
+
+            ShopConfirmListPatches.TryOpenQtyForConfirmGroupPublic(
+                confirmGroup, reason: "CallMethodProper.SetActive");
+        }
+        catch (Exception ex)
+        {
+            MerchantStackerPlugin.Log.LogWarning($"CallMethodProper hook: {ex.Message}");
+        }
+    }
+}
+
+/// <summary>
 /// Replace the shop's vanilla Yes/No "Purchase item?" confirm with qty UI for bulk items.
 /// </summary>
 [HarmonyPatch]
 internal static class ShopConfirmListPatches
 {
     private static bool _pendingQtyOpen;
+
+    internal static void ClearPendingQtyOpen() => _pendingQtyOpen = false;
+
+    internal static bool CanInterceptConfirmInputPublic() => CanInterceptConfirmInput();
+
+    internal static GameObject? FindConfirmGroupObjectPublic(GameObject go) => FindConfirmGroupObject(go);
+
+    internal static void TryOpenQtyForConfirmGroupPublic(GameObject confirmGroup, string reason) =>
+        TryOpenQtyForConfirmGroup(confirmGroup, reason);
+
+    internal static void SuppressConfirmChromePublic(Transform root) => PreHideConfirmChrome(root);
+
+    internal static bool IsUnderShopConfirmPublic(Transform? t) => IsUnderShopConfirmTransform(t);
 
     [HarmonyPrefix]
     [HarmonyPatch(
@@ -34,37 +225,93 @@ internal static class ShopConfirmListPatches
     }
 
     /// <summary>
-    /// PlayMaker activates confirm UI here — GameObject.SetActive Harmony is unreliable on Unity.
+    /// Shop idle/Yes use ListenForMenuActions → Fsm.Event → ProcessEvent.
+    /// Do not also patch Fsm.Event(string) — wrong param names abort the whole class.
     /// </summary>
-    [HarmonyPostfix]
-    [HarmonyPatch(typeof(ActivateGameObject), nameof(ActivateGameObject.OnEnter))]
-    private static void ActivateGameObjectPostfix(ActivateGameObject __instance)
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(Fsm), nameof(Fsm.ProcessEvent), typeof(FsmEvent), typeof(FsmEventData))]
+    private static bool FsmProcessEventPrefix(Fsm __instance, FsmEvent fsmEvent)
     {
+        if (fsmEvent == null || string.IsNullOrEmpty(fsmEvent.Name))
+        {
+            return true;
+        }
+
+        string eventName = fsmEvent.Name;
+
+        GameObject? ownerGo = null;
         try
         {
-            if (__instance.activate == null || !__instance.activate.Value || __instance.Fsm == null)
-            {
-                return;
-            }
-
-            GameObject? go = __instance.Fsm.GetOwnerDefaultTarget(__instance.gameObject);
-            if (go == null)
-            {
-                return;
-            }
-
-            GameObject? confirmGroup = FindConfirmGroupObject(go);
-            if (confirmGroup == null || !confirmGroup.activeInHierarchy)
-            {
-                return;
-            }
-
-            TryOpenQtyForConfirmGroup(confirmGroup, reason: "ActivateGameObject");
+            ownerGo = __instance.GameObject;
         }
-        catch (Exception ex)
+        catch
         {
-            MerchantStackerPlugin.Log.LogWarning($"ActivateGameObject hook: {ex.Message}");
+            return true;
         }
+
+        if (ownerGo == null || !IsShopFsmOwner(ownerGo))
+        {
+            return true;
+        }
+
+        // Qty owns the pad — swallow confirm-list navigation / submit so Yes/No can't move.
+        if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen
+            && IsConfirmNavOrSubmitEvent(eventName))
+        {
+            return false;
+        }
+
+        if (eventName != "UI CONFIRM" && eventName != "TO CONFIRM" && eventName != "UI SELECTION MADE")
+        {
+            return true;
+        }
+
+        return HandleConfirmEvent(ownerGo, eventName);
+    }
+
+    private static bool IsConfirmNavOrSubmitEvent(string eventName)
+    {
+        return eventName == "UI CONFIRM"
+            || eventName == "TO CONFIRM"
+            || eventName == "UI SELECTION MADE"
+            || eventName == "UI CANCEL"
+            || eventName == "CANCEL"
+            || eventName == "UI UP"
+            || eventName == "UI DOWN"
+            || eventName == "UI LEFT"
+            || eventName == "UI RIGHT"
+            || eventName == "UP"
+            || eventName == "DOWN"
+            || eventName == "LEFT"
+            || eventName == "RIGHT"
+            || eventName == "UI MOVE VERTICAL"
+            || eventName == "UI MOVE HORIZONTAL";
+    }
+
+    /// <summary>
+    /// Confirm Yes/No list reads left-stick in its own Update — mute it while qty is open.
+    /// </summary>
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(UISelectionList), "Update")]
+    private static bool ConfirmListUpdatePrefix(UISelectionList __instance)
+    {
+        if (QuantityPicker.Instance == null || !QuantityPicker.Instance.IsOpen)
+        {
+            return true;
+        }
+
+        if (!IsUnderShopConfirmList(__instance))
+        {
+            return true;
+        }
+
+        // Keep inactive; FSM may have re-enabled us this frame.
+        if (__instance.gameObject.activeSelf)
+        {
+            __instance.gameObject.SetActive(false);
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -74,6 +321,12 @@ internal static class ShopConfirmListPatches
     [HarmonyPatch(typeof(UISelectionListItem), nameof(UISelectionListItem.Submit))]
     private static bool ConfirmYesSubmitPrefix(UISelectionListItem __instance)
     {
+        if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen
+            && IsShopConfirmYes(__instance))
+        {
+            return false;
+        }
+
         if (!CanInterceptConfirmInput())
         {
             return true;
@@ -164,8 +417,33 @@ internal static class ShopConfirmListPatches
         {
             // Still block confirm spam while qty owns the pad.
             if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen
-                && (eventName == "UI CONFIRM" || eventName == "TO CONFIRM"))
+                && (eventName == "UI CONFIRM" || eventName == "TO CONFIRM"
+                    || eventName == "UI SELECTION MADE"))
             {
+                return false;
+            }
+
+            return true;
+        }
+
+        ShopItemStats? stats = ResolveBulkStatsNear(go) ?? ResolveBulkStatsNear(null);
+
+        // Yes/No while confirm is up — never let bulk Yes purchase; open qty instead.
+        if (eventName == "UI SELECTION MADE")
+        {
+            if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
+            {
+                return false;
+            }
+
+            if (stats != null && stats.Item != null
+                && Eligibility.IsBulkEligible(stats.Item)
+                && Eligibility.GetMaxQuantity(stats.Item) > 1
+                && HasActiveConfirmGroup())
+            {
+                MerchantStackerPlugin.Log.LogInfo(
+                    $"UI SELECTION MADE → qty (block Yes): {stats.Item.DisplayName}");
+                OpenQtyForStats(stats, reason: "UI SELECTION MADE");
                 return false;
             }
 
@@ -177,41 +455,21 @@ internal static class ShopConfirmListPatches
             return true;
         }
 
-        ShopItemStats? stats = ResolveBulkStatsNear(go) ?? ResolveBulkStatsNear(null);
-        bool onConfirm = HasActiveConfirmGroup();
-
-        // Already on confirm: A is "Yes" — steal it (never let purchase start).
-        if (eventName == "UI CONFIRM" && onConfirm)
-        {
-            if (stats != null && stats.Item != null)
-            {
-                MerchantStackerPlugin.Log.LogInfo(
-                    $"UI CONFIRM on confirm → qty (steal Yes): {stats.Item.DisplayName}");
-                OpenQtyForStats(stats, reason: "steal-Yes");
-                return false;
-            }
-
-            // Stats missing — still block purchase and keep trying to open qty.
-            foreach (Transform group in FindActiveConfirmGroups())
-            {
-                TryOpenQtyForConfirmGroup(group.gameObject, reason: "steal-Yes-retry");
-            }
-
-            return false;
-        }
-
-        // Opening confirm from the item list — allow FSM, replace chrome ASAP.
+        // Opening confirm (Idle → UI CONFIRM, or subitem → TO CONFIRM).
+        // Qty opens when confirm chrome SetActive fires (after Can Buy); here we arm/schedule.
         if (stats != null && stats.Item != null)
         {
             MerchantStackerPlugin.Log.LogInfo(
-                $"Confirm event '{eventName}' → schedule qty for {stats.Item.DisplayName}");
-            PreHideConfirmChrome(stats.transform.root);
+                $"Fsm '{eventName}' → arm qty for {stats.Item.DisplayName}");
+            PreHideConfirmChrome(go != null ? go.transform.root : stats.transform.root);
             OpenQtyForStats(stats, reason: eventName!);
         }
-        else
+        else if (QuantityPicker.Instance != null && !_pendingQtyOpen)
         {
             MerchantStackerPlugin.Log.LogInfo(
-                $"Confirm event '{eventName}' go={go?.name} — no bulk stats yet");
+                $"Fsm '{eventName}' go={go?.name} — no bulk stats yet; wait for confirm");
+            _pendingQtyOpen = true;
+            QuantityPicker.Instance.StartCoroutine(WaitForConfirmThenOpen(go));
         }
 
         return true;
@@ -248,6 +506,9 @@ internal static class ShopConfirmListPatches
         OpenQtyForStats(stats, reason: reason, stockHint: stock);
     }
 
+    /// <summary>
+    /// ActivateGameObject often targets Confirm / UI List — walk children and parents for the group.
+    /// </summary>
     private static GameObject? FindConfirmGroupObject(GameObject go)
     {
         if (go == null)
@@ -262,13 +523,42 @@ internal static class ShopConfirmListPatches
 
         foreach (Transform t in go.GetComponentsInChildren<Transform>(true))
         {
-            if (t != null && t.name == "Item Confirm Group" && t.gameObject.activeInHierarchy)
+            if (t != null && t.name == "Item Confirm Group")
             {
                 return t.gameObject;
             }
         }
 
+        Transform? p = go.transform.parent;
+        int guard = 0;
+        while (p != null && guard++ < 12)
+        {
+            if (p.name == "Item Confirm Group")
+            {
+                return p.gameObject;
+            }
+
+            p = p.parent;
+        }
+
         return null;
+    }
+
+    private static bool IsShopFsmOwner(GameObject ownerGo)
+    {
+        if (ownerGo == null)
+        {
+            return false;
+        }
+
+        if (ownerGo.GetComponentInParent<ShopMenuStock>(true) != null
+            || ownerGo.GetComponentInChildren<ShopMenuStock>(true) != null)
+        {
+            return true;
+        }
+
+        string n = ownerGo.name;
+        return n.IndexOf("Shop", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     internal static bool TryOpenQtyImmediate(ShopItemStats stats)
@@ -338,10 +628,29 @@ internal static class ShopConfirmListPatches
         PreHideConfirmChrome(root);
         ShopSelectionCache.Remember(stats);
 
-        if (FindActiveConfirmGroup(root) != null)
+        // UI CONFIRM fires before Can Buy — wait for confirm chrome (SetActive) unless already up.
+        // SetActive / Activate / TO CONFIRM / Yes steal → open immediately (skip Yes).
+        bool confirmVisible = FindActiveConfirmGroup(root) != null;
+        bool openNow = confirmVisible
+            || reason.StartsWith("SetActive", StringComparison.Ordinal)
+            || reason.StartsWith("Activate", StringComparison.Ordinal)
+            || reason.StartsWith("CallMethod", StringComparison.Ordinal)
+            || reason == "TO CONFIRM"
+            || reason == "UI SELECTION MADE"
+            || reason == "YesSubmit"
+            || reason == "immediate"
+            || reason.IndexOf("retry", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        if (openNow)
         {
+            _pendingQtyOpen = false;
             OpenQtyReplacingConfirm(stock, stats);
-            return QuantityPicker.Instance.IsOpen;
+            if (QuantityPicker.Instance.IsOpen)
+            {
+                MerchantStackerPlugin.Log.LogInfo(
+                    $"Confirm → qty replace: {item.DisplayName} (via '{reason}')");
+                return true;
+            }
         }
 
         if (_pendingQtyOpen)
@@ -358,7 +667,7 @@ internal static class ShopConfirmListPatches
 
     private static IEnumerator OpenQtyAfterConfirmShows(ShopMenuStock stock, ShopItemStats stats, string reason)
     {
-        for (int i = 0; i < 20; i++)
+        for (int i = 0; i < 45; i++)
         {
             yield return null;
             if (QuantityPicker.Instance == null || QuantityPicker.Instance.IsOpen)
@@ -373,22 +682,64 @@ internal static class ShopConfirmListPatches
                 yield break;
             }
 
-            PreHideConfirmChrome(stock.transform.root);
-
-            if (FindActiveConfirmGroup(stock.transform.root) != null || i >= 1)
+            // Only once confirm chrome is up (after Can Buy). Never open on a bare frame wait.
+            if (FindActiveConfirmGroup(stock.transform.root) == null)
             {
-                OpenQtyReplacingConfirm(stock, stats);
-                _pendingQtyOpen = false;
-                if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
-                {
-                    yield break;
-                }
+                continue;
+            }
+
+            PreHideConfirmChrome(stock.transform.root);
+            OpenQtyReplacingConfirm(stock, stats);
+            _pendingQtyOpen = false;
+            if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
+            {
+                yield break;
             }
         }
 
         _pendingQtyOpen = false;
         MerchantStackerPlugin.Log.LogWarning(
             $"Confirm qty: failed to open (via '{reason}')");
+    }
+
+    /// <summary>UI CONFIRM before cache/FSM vars are warm — open when confirm chrome appears.</summary>
+    private static IEnumerator WaitForConfirmThenOpen(GameObject? eventSource)
+    {
+        for (int i = 0; i < 45; i++)
+        {
+            yield return null;
+            if (QuantityPicker.Instance == null || QuantityPicker.Instance.IsOpen)
+            {
+                _pendingQtyOpen = false;
+                yield break;
+            }
+
+            Transform? group = null;
+            foreach (Transform t in FindActiveConfirmGroups())
+            {
+                group = t;
+                break;
+            }
+
+            if (group == null)
+            {
+                continue;
+            }
+
+            ShopItemStats? stats = ResolveBulkStatsNear(eventSource) ?? ResolveBulkStatsNear(group.gameObject);
+            if (stats == null || stats.Item == null)
+            {
+                continue;
+            }
+
+            _pendingQtyOpen = false;
+            MerchantStackerPlugin.Log.LogInfo(
+                $"Confirm wait → open qty: {stats.Item.DisplayName}");
+            OpenQtyForStats(stats, reason: "ConfirmWait", stockHint: FindShopStock(group.gameObject));
+            yield break;
+        }
+
+        _pendingQtyOpen = false;
     }
 
     private static void OpenQtyReplacingConfirm(ShopMenuStock stock, ShopItemStats stats)
@@ -479,12 +830,15 @@ internal static class ShopConfirmListPatches
             }
 
             string n = t.name;
-            if (n == "UI List" && t.parent != null && t.parent.name == "Confirm")
+            bool confirmUiList = n == "UI List" && t.parent != null && t.parent.name == "Confirm";
+            if (confirmUiList || n == "Confirm msg" || n == "Costs" || n == "Yes" || n == "No")
             {
-                t.gameObject.SetActive(false);
-            }
-            else if (n == "Confirm msg" || n == "Costs")
-            {
+                // Only kill Yes/No under the shop confirm list (not unrelated nodes).
+                if ((n == "Yes" || n == "No") && !IsUnderShopConfirmTransform(t))
+                {
+                    continue;
+                }
+
                 t.gameObject.SetActive(false);
             }
         }
@@ -586,7 +940,9 @@ internal static class ShopConfirmListPatches
 
         try
         {
-            foreach (PlayMakerFSM fsm in stock.GetComponentsInChildren<PlayMakerFSM>(true))
+            // FSMs often live on Shop Menu root, not only under Item List.
+            var fsms = stock.transform.root.GetComponentsInChildren<PlayMakerFSM>(true);
+            foreach (PlayMakerFSM fsm in fsms)
             {
                 if (fsm?.FsmVariables == null)
                 {
@@ -603,7 +959,7 @@ internal static class ShopConfirmListPatches
                     }
                 }
 
-                foreach (string name in new[] { "Current Item", "Item Number", "Selected Index" })
+                foreach (string name in new[] { "Current Item", "Item Number", "Selected Index", "Initial Item" })
                 {
                     var indexVar = fsm.FsmVariables.FindFsmInt(name);
                     if (indexVar == null)
@@ -611,13 +967,7 @@ internal static class ShopConfirmListPatches
                         continue;
                     }
 
-                    int index = indexVar.Value;
-                    if (index < 0 || index >= stock.GetItemCount())
-                    {
-                        continue;
-                    }
-
-                    var stats = ShopSelectionCache.GetStatsFromGameObject(stock.GetItemGameObject(index));
+                    ShopItemStats? stats = StatsFromStockIndex(stock, indexVar.Value);
                     if (stats?.Item != null)
                     {
                         return stats;
@@ -628,6 +978,27 @@ internal static class ShopConfirmListPatches
         catch
         {
             // ignored
+        }
+
+        return null;
+    }
+
+    private static ShopItemStats? StatsFromStockIndex(ShopMenuStock stock, int index)
+    {
+        int count = stock.GetItemCount();
+        // Try 0-based, then 1-based (FSM often stores 1..N).
+        foreach (int i in new[] { index, index - 1 })
+        {
+            if (i < 0 || i >= count)
+            {
+                continue;
+            }
+
+            var stats = ShopSelectionCache.GetStatsFromGameObject(stock.GetItemGameObject(i));
+            if (stats?.Item != null)
+            {
+                return stats;
+            }
         }
 
         return null;
