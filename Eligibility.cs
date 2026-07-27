@@ -3,6 +3,82 @@ namespace MerchantStacker;
 internal static class Eligibility
 {
     /// <summary>
+    /// Infinite-stock collectable listing (maps / uniques / bool flags excluded).
+    /// Ignores affordability and stack room — used to decide if MS may touch a shop at all.
+    /// </summary>
+    public static bool IsStackableShopOffer(ShopItem? item)
+    {
+        if (item == null)
+        {
+            return false;
+        }
+
+        // One-shot purchases (unique items, playerData bools).
+        if (item.IsAvailableNotInfinite)
+        {
+            return false;
+        }
+
+        // Cartographer wares (maps, pins, quill) and Bellhome furnishings are never bulk.
+        // Shakra sells only these, so MS must stay entirely out of her shop.
+        if (!IsBulkTypeFlags(item.GetTypeFlags()))
+        {
+            return false;
+        }
+
+        if (item.Cost <= 0)
+        {
+            return false;
+        }
+
+        return item.Item is CollectableItem;
+    }
+
+    private static bool IsBulkTypeFlags(ShopItem.TypeFlags flags) =>
+        flags == ShopItem.TypeFlags.None || flags == ShopItem.TypeFlags.Item;
+
+    /// <summary>
+    /// True when this merchant stock sells any infinite stackable wares.
+    /// Map-only shops (Shakra) must never be touched by MS chrome hooks.
+    /// </summary>
+    public static bool StockHasStackableOffers(ShopMenuStock? stock)
+    {
+        if (stock == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            ShopMenuStock source = stock.MasterList != null ? stock.MasterList : stock;
+            foreach (ShopItem item in source.EnumerateStock())
+            {
+                if (IsStackableShopOffer(item))
+                {
+                    return true;
+                }
+            }
+
+            // Child Item List may have empty stock[] and share Master's spawned rows.
+            int count = stock.GetItemCount();
+            for (int i = 0; i < count; i++)
+            {
+                var stats = stock.GetItemGameObject(i)?.GetComponent<ShopItemStats>();
+                if (IsStackableShopOffer(stats?.Item))
+                {
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            // ignored
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Infinite-stock shop items that still have room under their stack ceiling.
     /// </summary>
     public static bool IsBulkEligible(ShopItem? item)
@@ -12,13 +88,7 @@ internal static class Eligibility
             return false;
         }
 
-        // One-shot purchases (maps, unique items, playerData bools).
-        if (item.IsAvailableNotInfinite)
-        {
-            return false;
-        }
-
-        if (item.Cost <= 0)
+        if (!IsStackableShopOffer(item))
         {
             return false;
         }

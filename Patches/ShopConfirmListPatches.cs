@@ -82,6 +82,12 @@ internal static class ShopConfirmShowPatches
                 return;
             }
 
+            // Map-only shops (Shakra): never RestoreConfirmChrome — that woke her UI early.
+            if (!ShopConfirmListPatches.IsStackableMerchantConfirmPublic(confirmGroup))
+            {
+                return;
+            }
+
             if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
             {
                 return;
@@ -95,7 +101,7 @@ internal static class ShopConfirmShowPatches
             }
             else
             {
-                ShopConfirmListPatches.RestoreConfirmChromePublic(confirmGroup.transform);
+                ShopConfirmListPatches.RestoreConfirmChromePublic();
             }
         }
         catch (Exception ex)
@@ -132,7 +138,8 @@ internal static class ShopConfirmShowPatches
             }
 
             GameObject? confirmGroup = ShopConfirmListPatches.FindConfirmGroupObjectPublic(go);
-            if (confirmGroup == null)
+            if (confirmGroup == null
+                || !ShopConfirmListPatches.IsStackableMerchantConfirmPublic(confirmGroup))
             {
                 return;
             }
@@ -157,6 +164,9 @@ internal static class ShopConfirmListPatches
     /// <summary>Bulk row remembered at UI CONFIRM — used when SetActive(Confirm) runs before FSM vars update.</summary>
     private static ShopItemStats? _armedBulkStats;
 
+    /// <summary>Confirm chrome MS switched off, so restore can never activate anything else.</summary>
+    private static readonly HashSet<GameObject> HiddenChrome = new HashSet<GameObject>();
+
     internal static void ClearPendingQtyOpen()
     {
         _pendingQtyOpen = false;
@@ -172,9 +182,16 @@ internal static class ShopConfirmListPatches
 
     internal static void SuppressConfirmChromePublic(Transform root) => PreHideConfirmChrome(root);
 
-    internal static void RestoreConfirmChromePublic(Transform root) => RestoreConfirmChrome(root);
+    internal static void RestoreConfirmChromePublic() => RestoreConfirmChrome();
 
     internal static bool IsUnderShopConfirmPublic(Transform? t) => IsUnderShopConfirmTransform(t);
+
+    /// <summary>Confirm UI under a merchant that sells infinite stackables (not Shakra maps).</summary>
+    internal static bool IsStackableMerchantConfirmPublic(GameObject confirmGroup)
+    {
+        var stock = confirmGroup.GetComponentInParent<ShopMenuStock>(true);
+        return Eligibility.StockHasStackableOffers(stock);
+    }
 
     [HarmonyPrefix]
     [HarmonyPatch(
@@ -371,10 +388,16 @@ internal static class ShopConfirmListPatches
             return;
         }
 
-        ShopMenuStock? stock = __instance.GetComponentInParent<ShopMenuStock>(true) ?? FindAnyShopStock();
+        ShopMenuStock? stock = __instance.GetComponentInParent<ShopMenuStock>(true);
+        if (stock != null && !IsLiveOpenShopStock(stock))
+        {
+            // Confirm chrome under a dormant NPC shop (e.g. Shakra in-room prefab) — ignore.
+            return;
+        }
+
+        stock ??= FindActiveShopStock();
         ShopItemStats? stats = ResolveStatsFromStock(stock)
-            ?? ResolveBulkStatsNear(__instance.gameObject)
-            ?? ResolveBulkStatsNear(null);
+            ?? ResolveBulkStatsNear(__instance.gameObject);
 
         if (stats == null || stats.Item == null || !Eligibility.ShouldOfferBulkQty(stats.Item))
         {
@@ -396,13 +419,38 @@ internal static class ShopConfirmListPatches
     [HarmonyPatch(typeof(ShopMenuStock), "BuildItemList")]
     private static void BuildItemListPostfix(ShopMenuStock __instance)
     {
+        // Only merchants with infinite stackables (rosary strings, shard pouches, etc.).
+        // Never touch map-only shops — RestoreConfirmChrome woke Shakra before dialogue.
+        if (!Eligibility.StockHasStackableOffers(__instance))
+        {
+            return;
+        }
+
+        if (!IsLiveOpenShopStock(__instance))
+        {
+            return;
+        }
+
         // ResetShopWindow rebuilds the list — clear post-buy block so qty can open again.
         PurchaseBatcher.EndShopPurchaseBlock();
         ClearPendingQtyOpen();
-        RestoreConfirmChrome(__instance.transform.root);
+        RestoreConfirmChrome();
 
         MerchantStackerPlugin.Log.LogInfo(
-            $"Shop stock built: '{__instance.name}' items={__instance.GetItemCount()}");
+            $"Shop stock built (stackable): '{__instance.name}' items={DescribeStock(__instance)}");
+    }
+
+    /// <summary>Item names for logs — identifies which merchant MS engaged.</summary>
+    private static string DescribeStock(ShopMenuStock stock)
+    {
+        var names = new List<string>();
+        int count = stock.GetItemCount();
+        for (int i = 0; i < count; i++)
+        {
+            names.Add(stock.GetName(i));
+        }
+
+        return string.Join(", ", names);
     }
 
     /// <returns>False to suppress the FSM event.</returns>
@@ -502,7 +550,13 @@ internal static class ShopConfirmListPatches
             return QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen;
         }
 
-        ShopMenuStock? stock = confirmGroup.GetComponentInParent<ShopMenuStock>(true) ?? FindAnyShopStock();
+        ShopMenuStock? stock = confirmGroup.GetComponentInParent<ShopMenuStock>(true);
+        if (stock != null && !IsLiveOpenShopStock(stock))
+        {
+            return false;
+        }
+
+        stock ??= FindActiveShopStock();
         // Live selection, then row armed at UI CONFIRM (not an unrelated stale cache).
         ShopItemStats? current = ResolveCurrentShopStats(confirmGroup)
             ?? ResolveStatsFromStock(stock)
@@ -656,11 +710,17 @@ internal static class ShopConfirmListPatches
             }
         }
 
-        stock ??= FindAnyShopStock();
-        if (stock == null)
+        // Drop dormant NPC stock hints (Shakra prefab) — never open qty against them.
+        if (stock != null && !IsLiveOpenShopStock(stock))
+        {
+            stock = null;
+        }
+
+        stock ??= FindActiveShopStock();
+        if (stock == null || !IsLiveOpenShopStock(stock))
         {
             MerchantStackerPlugin.Log.LogWarning(
-                $"Confirm qty: no ShopMenuStock (via '{reason}') for {item.DisplayName}");
+                $"Confirm qty: no live ShopMenuStock (via '{reason}') for {item.DisplayName}");
             return false;
         }
 
@@ -810,8 +870,9 @@ internal static class ShopConfirmListPatches
             stats: stats);
     }
 
-    private static IEnumerator RetryOpenFromConfirmGroup(GameObject confirmGroup, ShopMenuStock? stock)
+    private static IEnumerator RetryOpenFromConfirmGroup(GameObject confirmGroup, ShopMenuStock? stockHint)
     {
+        ShopMenuStock? stock = stockHint;
         for (int i = 0; i < 12; i++)
         {
             yield return null;
@@ -828,7 +889,11 @@ internal static class ShopConfirmListPatches
                 yield break;
             }
 
-            stock ??= confirmGroup.GetComponentInParent<ShopMenuStock>(true) ?? FindAnyShopStock();
+            stock ??= confirmGroup.GetComponentInParent<ShopMenuStock>(true) ?? FindActiveShopStock();
+            if (stock != null && !IsLiveOpenShopStock(stock))
+            {
+                stock = FindActiveShopStock();
+            }
             ShopItemStats? stats = ResolveCurrentShopStats(confirmGroup)
                 ?? ResolveStatsFromStock(stock)
                 ?? _armedBulkStats;
@@ -852,13 +917,13 @@ internal static class ShopConfirmListPatches
         _pendingQtyOpen = false;
         if (confirmGroup != null)
         {
-            RestoreConfirmChrome(confirmGroup.transform);
+            RestoreConfirmChrome();
         }
     }
 
     private static void PreHideConfirmChrome(Transform root)
     {
-        if (root == null)
+        if (root == null || !RootHasStackableMerchant(root))
         {
             return;
         }
@@ -882,63 +947,46 @@ internal static class ShopConfirmListPatches
                     continue;
                 }
 
+                HiddenChrome.Add(t.gameObject);
                 t.gameObject.SetActive(false);
             }
         }
     }
 
     /// <summary>
-    /// Re-enable Confirm + Yes/No/Costs. Qty PreHide leaves Confirm inactive — without
-    /// reactivating it, Yes/No stay invisible (blank softlock when max qty drops to 1).
+    /// Undo our own hides only. Blindly re-activating Confirm/Yes/No by name woke shops we
+    /// never opened (Shakra's stall appeared during other NPCs' dialogue).
     /// </summary>
-    private static void RestoreConfirmChrome(Transform root)
+    private static void RestoreConfirmChrome()
     {
-        if (root == null)
+        if (HiddenChrome.Count == 0)
         {
             return;
         }
 
-        foreach (Transform t in root.GetComponentsInChildren<Transform>(true))
+        foreach (GameObject go in HiddenChrome)
         {
-            if (t == null)
+            if (go != null && !go.activeSelf)
             {
-                continue;
-            }
-
-            string n = t.name;
-
-            // Parent panel must be on or Yes/No never appear.
-            if (n == "Confirm"
-                && t.parent != null
-                && t.parent.name == "Item Confirm Group"
-                && !t.gameObject.activeSelf)
-            {
-                t.gameObject.SetActive(true);
-                continue;
-            }
-
-            bool confirmUiList = n == "UI List" && t.parent != null && t.parent.name == "Confirm";
-            if (!confirmUiList && n != "Confirm msg" && n != "Costs" && n != "Yes" && n != "No")
-            {
-                continue;
-            }
-
-            if ((n == "Yes" || n == "No") && !IsUnderShopConfirmTransform(t))
-            {
-                continue;
-            }
-
-            // Skip "Confirm msg" — leave Purchase Item? text off; Yes/No is enough.
-            if (n == "Confirm msg")
-            {
-                continue;
-            }
-
-            if (!t.gameObject.activeSelf)
-            {
-                t.gameObject.SetActive(true);
+                go.SetActive(true);
             }
         }
+
+        HiddenChrome.Clear();
+    }
+
+    /// <summary>Refuse chrome SetActive on map-only / non-stackable shop hierarchies.</summary>
+    private static bool RootHasStackableMerchant(Transform root)
+    {
+        foreach (ShopMenuStock stock in root.GetComponentsInChildren<ShopMenuStock>(true))
+        {
+            if (Eligibility.StockHasStackableOffers(stock))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool HasActiveConfirmGroup()
@@ -947,8 +995,7 @@ internal static class ShopConfirmListPatches
     }
 
     /// <summary>
-    /// Lightweight: only scene-valid stocks (include inactive — list is off during confirm).
-    /// Used sparingly on UI CONFIRM, not every frame.
+    /// Stocks under an open shop pane (stock GO itself is often inactive during confirm).
     /// </summary>
     private static List<Transform> FindActiveConfirmGroups()
     {
@@ -956,19 +1003,7 @@ internal static class ShopConfirmListPatches
         foreach (ShopMenuStock stock in UnityEngine.Object.FindObjectsByType<ShopMenuStock>(
                      FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
-            if (stock == null)
-            {
-                continue;
-            }
-
-            try
-            {
-                if (!stock.gameObject.scene.IsValid())
-                {
-                    continue;
-                }
-            }
-            catch
+            if (!IsLiveOpenShopStock(stock))
             {
                 continue;
             }
@@ -1004,7 +1039,13 @@ internal static class ShopConfirmListPatches
     /// <summary>Live highlighted shop row from FSM/stock — ignores stale cache.</summary>
     private static ShopItemStats? ResolveCurrentShopStats(GameObject? go)
     {
-        ShopMenuStock? stock = FindShopStock(go) ?? FindAnyShopStock();
+        ShopMenuStock? stock = FindShopStock(go);
+        if (stock != null && !IsLiveOpenShopStock(stock))
+        {
+            stock = null;
+        }
+
+        stock ??= FindActiveShopStock();
         ShopItemStats? current = ResolveStatsFromStock(stock);
         if (current == null && go != null)
         {
@@ -1158,7 +1199,7 @@ internal static class ShopConfirmListPatches
             t = t.parent;
         }
 
-        return underConfirm && FindAnyShopStock() != null;
+        return underConfirm && FindActiveShopStock() != null;
     }
 
     private static ShopMenuStock? FindShopStock(GameObject? go)
@@ -1174,45 +1215,85 @@ internal static class ShopConfirmListPatches
             ?? go.transform.root.GetComponentInChildren<ShopMenuStock>(true);
     }
 
-    private static ShopMenuStock? FindAnyShopStock()
+    /// <summary>
+    /// Only the shop the player is actually in. Never fall back to dormant prefabs
+    /// (Shakra's map shop often sits in rooms where she isn't present).
+    /// Stock GO is frequently inactive while Item Confirm Group is up — use Include.
+    /// </summary>
+    private static ShopMenuStock? FindActiveShopStock()
     {
-        ShopMenuStock? fallback = null;
         foreach (ShopMenuStock stock in UnityEngine.Object.FindObjectsByType<ShopMenuStock>(
                      FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
-            if (stock == null || !stock.gameObject.scene.IsValid())
-            {
-                continue;
-            }
-
-            try
-            {
-                if (stock.GetItemCount() <= 0)
-                {
-                    continue;
-                }
-            }
-            catch
-            {
-                continue;
-            }
-
-            if (stock.isActiveAndEnabled)
+            if (IsLiveOpenShopStock(stock))
             {
                 return stock;
             }
-
-            fallback ??= stock;
         }
 
-        return fallback;
+        return null;
     }
+
+    /// <summary>
+    /// True when this stock is an MS target (has stackables) and its shop UI is open.
+    /// Map-only / dormant NPC shops (Shakra) are never live for us.
+    /// Stock itself may be inactive during confirm; the inventory pane must still be live.
+    /// </summary>
+    internal static bool IsLiveOpenShopStock(ShopMenuStock? stock)
+    {
+        if (stock == null || !Eligibility.StockHasStackableOffers(stock))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!stock.gameObject.scene.IsValid())
+            {
+                return false;
+            }
+
+            if (stock.GetItemCount() <= 0)
+            {
+                return false;
+            }
+
+            // Pane open = player is in this shop. Stock GO alone can flicker during SetStock.
+            var pane = stock.GetComponentInParent<InventoryPaneBase>(true);
+            if (pane != null)
+            {
+                return pane.gameObject.activeInHierarchy;
+            }
+
+            // No pane wrapper: require stock or its confirm group visible in hierarchy.
+            if (stock.gameObject.activeInHierarchy)
+            {
+                return true;
+            }
+
+            return FindActiveConfirmGroup(stock.transform.root) != null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Legacy name — active shop only (never inactive fallbacks).</summary>
+    private static ShopMenuStock? FindAnyShopStock() => FindActiveShopStock();
 
     private static ShopItemStats? FindHighlightedBulk()
     {
         foreach (InventoryItemManager manager in UnityEngine.Object.FindObjectsByType<InventoryItemManager>(FindObjectsSortMode.None))
         {
-            if (manager?.CurrentSelected == null)
+            if (manager?.CurrentSelected == null || !manager.isActiveAndEnabled)
+            {
+                continue;
+            }
+
+            // Must be under a live open shop, not a dormant Shakra prefab selection.
+            var stock = manager.GetComponentInParent<ShopMenuStock>(true);
+            if (stock != null && !IsLiveOpenShopStock(stock))
             {
                 continue;
             }

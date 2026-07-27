@@ -219,7 +219,7 @@ internal sealed class QuantityPicker : MonoBehaviour
             _shopRoot = null;
             _shopStats = null;
             InventoryPaneInput.IsInputBlocked = false;
-            Patches.ShopConfirmListPatches.RestoreConfirmChromePublic(shopRoot.root);
+            Patches.ShopConfirmListPatches.RestoreConfirmChromePublic();
             return;
         }
 
@@ -1519,12 +1519,13 @@ internal sealed class QuantityPicker : MonoBehaviour
             root = null;
         }
 
+        // Never grab a dormant in-scene shop (e.g. Shakra) just to scrub confirm chrome.
         if (root == null)
         {
             foreach (ShopMenuStock stock in UnityEngine.Object.FindObjectsByType<ShopMenuStock>(
                          FindObjectsInactive.Include, FindObjectsSortMode.None))
             {
-                if (stock == null || !stock.gameObject.scene.IsValid())
+                if (!Patches.ShopConfirmListPatches.IsLiveOpenShopStock(stock))
                 {
                     continue;
                 }
@@ -1540,7 +1541,7 @@ internal sealed class QuantityPicker : MonoBehaviour
         }
 
         // Children keep activeSelf across parent toggle — re-enable before hiding group.
-        Patches.ShopConfirmListPatches.RestoreConfirmChromePublic(root);
+        Patches.ShopConfirmListPatches.RestoreConfirmChromePublic();
         foreach (Transform t in root.GetComponentsInChildren<Transform>(true))
         {
             if (t != null && t.name == "Item Confirm Group" && t.gameObject.activeSelf)
