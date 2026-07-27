@@ -510,7 +510,9 @@ internal static class ShopConfirmListPatches
         }
 
         // UI CONFIRM is before Can Buy — never open or PreHide here.
-        // Arm the live bulk row so SetActive(Confirm) can open even if FSM vars lag.
+        // Arm + poll for confirm chrome: Frey's shop (and others) activate Confirm via
+        // GameObject.SetActive, which we do not Harmony-patch (global hitch). Without this
+        // wait, qty only opened on UI SELECTION MADE after the player pressed vanilla Yes.
         if (eventName == "UI CONFIRM")
         {
             ShopItemStats? current = ResolveCurrentShopStats(go);
@@ -520,6 +522,7 @@ internal static class ShopConfirmListPatches
                 _armedBulkStats = current;
                 MerchantStackerPlugin.Log.LogInfo(
                     $"Fsm 'UI CONFIRM' → armed qty for {current.Item.DisplayName}");
+                ScheduleOpenWhenConfirmShows(current);
             }
             else
             {
@@ -758,6 +761,45 @@ internal static class ShopConfirmListPatches
         return false;
     }
 
+    /// <summary>
+    /// After UI CONFIRM arms a bulk row, wait until Item Confirm Group is live (post Can Buy),
+    /// then replace Yes/No with qty. Covers shops that SetActive Confirm outside our hooks.
+    /// </summary>
+    private static void ScheduleOpenWhenConfirmShows(ShopItemStats stats)
+    {
+        if (_pendingQtyOpen || QuantityPicker.Instance == null || stats?.Item == null)
+        {
+            return;
+        }
+
+        ShopMenuStock? stock = null;
+        try
+        {
+            stock = stats.GetComponentInParent<ShopMenuStock>(true);
+        }
+        catch
+        {
+            stock = null;
+        }
+
+        if (stock != null && !IsLiveOpenShopStock(stock))
+        {
+            stock = null;
+        }
+
+        stock ??= FindActiveShopStock();
+        if (stock == null || !IsLiveOpenShopStock(stock))
+        {
+            MerchantStackerPlugin.Log.LogWarning(
+                $"Confirm qty wait: no live stock for {stats.Item.DisplayName}");
+            return;
+        }
+
+        _pendingQtyOpen = true;
+        QuantityPicker.Instance.StartCoroutine(
+            OpenQtyAfterConfirmShows(stock, stats, "UI CONFIRM.wait"));
+    }
+
     private static IEnumerator OpenQtyAfterConfirmShows(ShopMenuStock stock, ShopItemStats stats, string reason)
     {
         for (int i = 0; i < 45; i++)
@@ -781,11 +823,15 @@ internal static class ShopConfirmListPatches
                 continue;
             }
 
+            // Kill Yes/No this frame before they can take input / flash.
             PreHideConfirmChrome(stock.transform.root);
+            MerchantStackerPlugin.Log.LogInfo(
+                $"{reason} → open qty: {stats.Item.DisplayName}");
             OpenQtyReplacingConfirm(stock, stats);
             _pendingQtyOpen = false;
             if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
             {
+                _armedBulkStats = null;
                 yield break;
             }
         }
