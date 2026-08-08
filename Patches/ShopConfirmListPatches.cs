@@ -167,6 +167,51 @@ internal static class ShopConfirmListPatches
     /// <summary>Confirm chrome MS switched off, so restore can never activate anything else.</summary>
     private static readonly HashSet<GameObject> HiddenChrome = new HashSet<GameObject>();
 
+    /// <summary>Consecutive idle frames where Yes/No stayed hidden but no qty opened.</summary>
+    private static int _blankConfirmFrames;
+
+    /// <summary>Idle frames to tolerate before the watchdog restores vanilla Yes/No.</summary>
+    private const int BlankConfirmRestoreFrames = 20;
+
+    /// <summary>
+    /// Safety net (pumped every frame): if we hid Yes/No but no qty picker opened — a spam
+    /// race, a failed OpenInShop, or a coroutine that gave up — the shop confirm is left blank
+    /// (item + Confirm/Cancel prompts, no Yes/No, no qty), which softlocks the player. After a
+    /// short idle we restore vanilla Yes/No so a mistimed open can never trap them.
+    /// </summary>
+    internal static void PumpBlankConfirmWatchdog()
+    {
+        if (HiddenChrome.Count == 0)
+        {
+            _blankConfirmFrames = 0;
+            return;
+        }
+
+        // Any of these means the hidden chrome is expected (qty owns the pad, a buy is settling,
+        // or an open is still in flight) — never fight those transitions.
+        bool busy = _pendingQtyOpen
+            || (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
+            || PurchaseBatcher.IsBatching
+            || PurchaseBatcher.BlockShopPurchases
+            || PurchaseBatcher.ExpectingFsmPurchase;
+        if (busy)
+        {
+            _blankConfirmFrames = 0;
+            return;
+        }
+
+        if (++_blankConfirmFrames < BlankConfirmRestoreFrames)
+        {
+            return;
+        }
+
+        _blankConfirmFrames = 0;
+        MerchantStackerPlugin.Log.LogWarning(
+            "Blank confirm watchdog → restoring vanilla Yes/No (qty never opened)");
+        RestoreConfirmChrome();
+        ClearPendingQtyOpen();
+    }
+
     internal static void ClearPendingQtyOpen()
     {
         _pendingQtyOpen = false;
@@ -837,8 +882,10 @@ internal static class ShopConfirmListPatches
         }
 
         _pendingQtyOpen = false;
+        // Never strand hidden Yes/No — put vanilla confirm back so the player can still buy.
+        RestoreConfirmChrome();
         MerchantStackerPlugin.Log.LogWarning(
-            $"Confirm qty: failed to open (via '{reason}')");
+            $"Confirm qty: failed to open (via '{reason}') — restored vanilla confirm");
     }
 
     /// <summary>UI CONFIRM before cache/FSM vars are warm — open when confirm chrome appears.</summary>

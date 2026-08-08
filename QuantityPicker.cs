@@ -1945,6 +1945,9 @@ internal sealed class QuantityPicker : MonoBehaviour
 
     private void Update()
     {
+        // Runs even when closed: restores vanilla Yes/No if a spam race left confirm blank.
+        Patches.ShopConfirmListPatches.PumpBlankConfirmWatchdog();
+
         if (!_active)
         {
             return;
