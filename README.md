@@ -4,6 +4,8 @@ QOL mod for Hollow Knight: Silksong — buy stackable merchant refills (rosary s
 
 [Demonstration](https://github.com/user-attachments/assets/e88ae520-edc6-4bd1-a329-e501b698577c)
 
+<img width="720" height="810" alt="comparison" src="https://github.com/user-attachments/assets/9258997b-eeae-4cfc-8770-6a8d8a76e890" />
+
 ## Features
 
 - On eligible **infinite-stock** shop items with a stack ceiling, the normal purchase confirm becomes a **quantity confirm**
