@@ -173,11 +173,16 @@ internal static class ShopConfirmListPatches
     /// <summary>Idle frames to tolerate before the watchdog restores vanilla Yes/No.</summary>
     private const int BlankConfirmRestoreFrames = 20;
 
+    /// <summary>Ignore UI CONFIRM until this unscaled time (avoids ResetShopWindow phantom arms).</summary>
+    private static float _ignoreUiConfirmUntil;
+
+    /// <summary>Active UI CONFIRM.wait coroutine — restarted on each fresh arm.</summary>
+    private static Coroutine? _confirmWaitCo;
+
     /// <summary>
-    /// Safety net (pumped every frame): blank confirm = Item Confirm Group live with Yes/No
-    /// off and no qty pad. Happens on spam races, failed OpenInShop, or after cancel when
-    /// children kept activeSelf=false across ResetShopWindow. HiddenChrome alone is not enough
-    /// — restore can clear the set while Yes/No stay inactive on a rebuilt hierarchy.
+    /// Safety net: only when WE hid chrome (HiddenChrome) and qty never opened.
+    /// Do not scan resting confirm trees — Frey's Item Confirm Group often exists with Yes/No
+    /// off on the item list; treating that as "blank" fought PreHide and softlocked re-entry.
     /// </summary>
     internal static void PumpBlankConfirmWatchdog()
     {
@@ -188,14 +193,7 @@ internal static class ShopConfirmListPatches
             || PurchaseBatcher.IsBatching
             || PurchaseBatcher.BlockShopPurchases
             || PurchaseBatcher.ExpectingFsmPurchase;
-        if (busy)
-        {
-            _blankConfirmFrames = 0;
-            return;
-        }
-
-        bool stranded = HiddenChrome.Count > 0 || HasBlankConfirmGroup();
-        if (!stranded)
+        if (busy || HiddenChrome.Count == 0)
         {
             _blankConfirmFrames = 0;
             return;
@@ -214,98 +212,86 @@ internal static class ShopConfirmListPatches
         ClearPendingQtyOpen();
     }
 
-    /// <summary>
-    /// Live Item Confirm Group whose Yes/No (or Confirm UI List) are inactive — the softlock
-    /// the player sees after a mistimed qty open/cancel.
-    /// </summary>
-    private static bool HasBlankConfirmGroup()
+    /// <summary>Call after our ResetShopWindow so FSM echo UI CONFIRMs do not start a dead wait.</summary>
+    internal static void BeginUiConfirmGrace(float seconds = 0.4f)
     {
-        foreach (Transform group in FindActiveConfirmGroups())
-        {
-            if (group == null)
-            {
-                continue;
-            }
-
-            Transform? confirm = FindNamedChild(group, "Confirm") ?? group;
-            Transform? uiList = FindNamedChild(confirm, "UI List");
-            Transform? yes = FindNamedChild(confirm, "Yes");
-            Transform? no = FindNamedChild(confirm, "No");
-
-            bool listOff = uiList != null && !uiList.gameObject.activeSelf;
-            bool yesOff = yes != null && !yes.gameObject.activeSelf;
-            bool noOff = no != null && !no.gameObject.activeSelf;
-            if (listOff || (yesOff && noOff))
-            {
-                return true;
-            }
-        }
-
-        return false;
+        _ignoreUiConfirmUntil = Time.unscaledTime + Math.Max(0.05f, seconds);
+        StopConfirmWaitCoroutine();
+        _pendingQtyOpen = false;
+        _armedBulkStats = null;
     }
 
-    /// <summary>Re-enable Yes/No/UI List under live confirm groups by name (not HiddenChrome).</summary>
+    /// <summary>Re-enable Yes/No/UI List under confirm groups by name (incl. inactive parents).</summary>
     private static void ForceEnableConfirmYesNo()
     {
-        foreach (Transform group in FindActiveConfirmGroups())
+        foreach (ShopMenuStock stock in UnityEngine.Object.FindObjectsByType<ShopMenuStock>(
+                     FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
-            if (group == null)
+            if (stock == null || !Eligibility.StockHasStackableOffers(stock))
             {
                 continue;
             }
 
-            foreach (Transform t in group.GetComponentsInChildren<Transform>(true))
+            foreach (Transform t in stock.transform.root.GetComponentsInChildren<Transform>(true))
             {
-                if (t == null)
+                if (t == null || t.name != "Item Confirm Group")
                 {
                     continue;
                 }
 
-                string n = t.name;
-                bool confirmUiList = n == "UI List" && t.parent != null && t.parent.name == "Confirm";
-                if (!confirmUiList && n != "Yes" && n != "No" && n != "Confirm msg" && n != "Costs")
-                {
-                    continue;
-                }
-
-                if ((n == "Yes" || n == "No") && !IsUnderShopConfirmTransform(t))
-                {
-                    continue;
-                }
-
-                if (!t.gameObject.activeSelf)
-                {
-                    t.gameObject.SetActive(true);
-                }
+                ForceEnableConfirmChildren(t);
             }
         }
     }
 
-    private static Transform? FindNamedChild(Transform root, string name)
+    private static void ForceEnableConfirmChildren(Transform confirmGroup)
     {
-        if (root == null)
+        foreach (Transform t in confirmGroup.GetComponentsInChildren<Transform>(true))
         {
-            return null;
-        }
-
-        if (root.name == name)
-        {
-            return root;
-        }
-
-        foreach (Transform t in root.GetComponentsInChildren<Transform>(true))
-        {
-            if (t != null && t.name == name)
+            if (t == null)
             {
-                return t;
+                continue;
+            }
+
+            string n = t.name;
+            bool confirmUiList = n == "UI List" && t.parent != null && t.parent.name == "Confirm";
+            if (!confirmUiList && n != "Yes" && n != "No" && n != "Confirm msg" && n != "Costs")
+            {
+                continue;
+            }
+
+            if ((n == "Yes" || n == "No") && !IsUnderShopConfirmTransform(t))
+            {
+                continue;
+            }
+
+            if (!t.gameObject.activeSelf)
+            {
+                t.gameObject.SetActive(true);
+            }
+        }
+    }
+
+    private static void StopConfirmWaitCoroutine()
+    {
+        if (_confirmWaitCo != null && QuantityPicker.Instance != null)
+        {
+            try
+            {
+                QuantityPicker.Instance.StopCoroutine(_confirmWaitCo);
+            }
+            catch
+            {
+                // ignored
             }
         }
 
-        return null;
+        _confirmWaitCo = null;
     }
 
     internal static void ClearPendingQtyOpen()
     {
+        StopConfirmWaitCoroutine();
         _pendingQtyOpen = false;
         _armedBulkStats = null;
     }
@@ -655,6 +641,13 @@ internal static class ShopConfirmListPatches
         // wait, qty only opened on UI SELECTION MADE after the player pressed vanilla Yes.
         if (eventName == "UI CONFIRM")
         {
+            // ResetShopWindow often echoes UI CONFIRM; a wait started then never sees chrome
+            // and blocks the real arm (_pendingQtyOpen). Grace clears that race.
+            if (Time.unscaledTime < _ignoreUiConfirmUntil)
+            {
+                return true;
+            }
+
             ShopItemStats? current = ResolveCurrentShopStats(go);
             if (current?.Item != null && Eligibility.ShouldOfferBulkQty(current.Item))
             {
@@ -667,6 +660,7 @@ internal static class ShopConfirmListPatches
             else
             {
                 _armedBulkStats = null;
+                StopConfirmWaitCoroutine();
                 _pendingQtyOpen = false;
             }
 
@@ -907,7 +901,7 @@ internal static class ShopConfirmListPatches
     /// </summary>
     private static void ScheduleOpenWhenConfirmShows(ShopItemStats stats)
     {
-        if (_pendingQtyOpen || QuantityPicker.Instance == null || stats?.Item == null)
+        if (QuantityPicker.Instance == null || stats?.Item == null)
         {
             return;
         }
@@ -935,8 +929,10 @@ internal static class ShopConfirmListPatches
             return;
         }
 
+        // Always restart — a phantom arm from ResetShopWindow must not block the real one.
+        StopConfirmWaitCoroutine();
         _pendingQtyOpen = true;
-        QuantityPicker.Instance.StartCoroutine(
+        _confirmWaitCo = QuantityPicker.Instance.StartCoroutine(
             OpenQtyAfterConfirmShows(stock, stats, "UI CONFIRM.wait"));
     }
 
@@ -949,12 +945,14 @@ internal static class ShopConfirmListPatches
             if (QuantityPicker.Instance == null || QuantityPicker.Instance.IsOpen)
             {
                 _pendingQtyOpen = false;
+                _confirmWaitCo = null;
                 yield break;
             }
 
             if (stats == null)
             {
                 _pendingQtyOpen = false;
+                _confirmWaitCo = null;
                 yield break;
             }
 
@@ -999,6 +997,7 @@ internal static class ShopConfirmListPatches
                 $"{reason} → open qty: {stats.Item.DisplayName}");
             OpenQtyReplacingConfirm(liveStock, stats);
             _pendingQtyOpen = false;
+            _confirmWaitCo = null;
             if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
             {
                 _armedBulkStats = null;
@@ -1014,6 +1013,7 @@ internal static class ShopConfirmListPatches
         }
 
         _pendingQtyOpen = false;
+        _confirmWaitCo = null;
         // Never strand hidden Yes/No — put vanilla confirm back so the player can still buy.
         RestoreConfirmChrome();
         ForceEnableConfirmYesNo();

@@ -1239,33 +1239,31 @@ internal sealed class QuantityPicker : MonoBehaviour
         int total = _unitCost * _quantity;
         bool qtyChanged = _quantity != _lastHudQty;
         bool totalChanged = total != _lastHudTotal;
-        if (!qtyChanged && !totalChanged)
-        {
-            return;
-        }
 
         _lastHudQty = _quantity;
         _lastHudTotal = total;
 
-        if (qtyChanged)
-        {
-            ApplyTmp(_hudQty, _quantity.ToString(CultureInfo.InvariantCulture));
-        }
+        // Always push both strings — TMProOld can keep a stale mesh when shortening
+        // (e.g. 280 → 140) if we skip SetText based on a mismatched .text readback.
+        ApplyTmp(_hudQty, _quantity.ToString(CultureInfo.InvariantCulture), force: qtyChanged || totalChanged);
+        ApplyTmp(_hudCost, total.ToString(CultureInfo.InvariantCulture), force: true);
 
-        if (totalChanged)
+        // Native Costs can wake via CallMethodProper; keep unit-price chrome off and never
+        // let a leftover Item cost show a prior bulk total.
+        if (_shopStats != null && (_hiddenNativeCost.Count > 0 || totalChanged))
         {
-            ApplyTmp(_hudCost, total.ToString(CultureInfo.InvariantCulture));
+            KeepNativeConfirmCostsHidden();
         }
 
         bool upOn = _quantity < _max;
         bool downOn = _quantity > _min;
-        if (upOn != _lastArrowUpOn)
+        if (upOn != _lastArrowUpOn || qtyChanged)
         {
             _lastArrowUpOn = upOn;
             SetArrowVisible(_hudArrowUp, upOn, _arrowUpBaseLocalScale);
         }
 
-        if (downOn != _lastArrowDownOn)
+        if (downOn != _lastArrowDownOn || qtyChanged)
         {
             _lastArrowDownOn = downOn;
             SetArrowVisible(_hudArrowDown, downOn, _arrowDownBaseLocalScale);
@@ -1336,7 +1334,7 @@ internal sealed class QuantityPicker : MonoBehaviour
         }
     }
 
-    private static void ApplyTmp(TextMeshPro? tmp, string value)
+    private static void ApplyTmp(TextMeshPro? tmp, string value, bool force = false)
     {
         if (tmp == null)
         {
@@ -1358,8 +1356,11 @@ internal sealed class QuantityPicker : MonoBehaviour
                 tmp.color = c;
             }
 
-            if (tmp.text != value)
+            // Compare trimmed readback — rich-text / null leftovers made != skip updates.
+            string current = tmp.text ?? string.Empty;
+            if (force || !string.Equals(current.Trim(), value, StringComparison.Ordinal))
             {
+                tmp.text = value;
                 tmp.SetText(value);
                 tmp.ForceMeshUpdate(true);
             }
@@ -1373,6 +1374,19 @@ internal sealed class QuantityPicker : MonoBehaviour
         catch
         {
             // ignored
+        }
+    }
+
+    /// <summary>Re-hide Costs/Money/Item cost if the shop FSM woke them during qty adjust.</summary>
+    private void KeepNativeConfirmCostsHidden()
+    {
+        for (int i = 0; i < _hiddenNativeCost.Count; i++)
+        {
+            GameObject go = _hiddenNativeCost[i];
+            if (go != null && go.activeSelf)
+            {
+                go.SetActive(false);
+            }
         }
     }
 
@@ -1864,9 +1878,9 @@ internal sealed class QuantityPicker : MonoBehaviour
         _shopCancel = null;
         _item = null;
 
-        // Cancel: scrub our HUD and force-hide confirm chrome. Do not re-enable Yes/No/Costs
-        // (that left unit-price overlays). ResetShopWindow rebuilds a clean item list.
-        DestroyInShopHud(restoreTexts: true, restoreConfirmChrome: false);
+        // Purchase: leave confirm chrome hidden for thank-you. Cancel: restore Yes/No first so
+        // ResetShopWindow does not inherit inactive children (blank softlock on re-confirm).
+        DestroyInShopHud(restoreTexts: true, restoreConfirmChrome: !confirmed);
         ForceHideConfirmChromeOnly(shopStats);
         ClearPickerHudChildren();
         ResetHoldState();
@@ -1897,7 +1911,9 @@ internal sealed class QuantityPicker : MonoBehaviour
                 ClearPickerHudChildren();
                 ForceHideConfirmChromeOnly(shopStats);
                 ShopSelectionCache.Clear();
-                Patches.ShopConfirmListPatches.ClearPendingQtyOpen();
+                // Swallow FSM UI CONFIRM echoes from ResetShopWindow so they cannot arm a
+                // dead wait that blocks the next real confirm.
+                Patches.ShopConfirmListPatches.BeginUiConfirmGrace();
                 shopCancel?.Invoke();
                 ScrubLeftoverQtyHud();
                 ClearPickerHudChildren();
