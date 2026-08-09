@@ -2,6 +2,8 @@
 
 QOL mod for Hollow Knight: Silksong — buy stackable merchant refills (rosary strings, shard pouches, etc.) in bulk instead of mashing confirm.
 
+[Demonstration](https://github.com/user-attachments/assets/e88ae520-edc6-4bd1-a329-e501b698577c)
+
 ## Features
 
 - On eligible **infinite-stock** shop items with a stack ceiling, the normal purchase confirm becomes a **quantity confirm**
