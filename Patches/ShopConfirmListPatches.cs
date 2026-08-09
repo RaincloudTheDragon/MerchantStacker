@@ -174,19 +174,13 @@ internal static class ShopConfirmListPatches
     private const int BlankConfirmRestoreFrames = 20;
 
     /// <summary>
-    /// Safety net (pumped every frame): if we hid Yes/No but no qty picker opened — a spam
-    /// race, a failed OpenInShop, or a coroutine that gave up — the shop confirm is left blank
-    /// (item + Confirm/Cancel prompts, no Yes/No, no qty), which softlocks the player. After a
-    /// short idle we restore vanilla Yes/No so a mistimed open can never trap them.
+    /// Safety net (pumped every frame): blank confirm = Item Confirm Group live with Yes/No
+    /// off and no qty pad. Happens on spam races, failed OpenInShop, or after cancel when
+    /// children kept activeSelf=false across ResetShopWindow. HiddenChrome alone is not enough
+    /// — restore can clear the set while Yes/No stay inactive on a rebuilt hierarchy.
     /// </summary>
     internal static void PumpBlankConfirmWatchdog()
     {
-        if (HiddenChrome.Count == 0)
-        {
-            _blankConfirmFrames = 0;
-            return;
-        }
-
         // Any of these means the hidden chrome is expected (qty owns the pad, a buy is settling,
         // or an open is still in flight) — never fight those transitions.
         bool busy = _pendingQtyOpen
@@ -195,6 +189,13 @@ internal static class ShopConfirmListPatches
             || PurchaseBatcher.BlockShopPurchases
             || PurchaseBatcher.ExpectingFsmPurchase;
         if (busy)
+        {
+            _blankConfirmFrames = 0;
+            return;
+        }
+
+        bool stranded = HiddenChrome.Count > 0 || HasBlankConfirmGroup();
+        if (!stranded)
         {
             _blankConfirmFrames = 0;
             return;
@@ -209,7 +210,98 @@ internal static class ShopConfirmListPatches
         MerchantStackerPlugin.Log.LogWarning(
             "Blank confirm watchdog → restoring vanilla Yes/No (qty never opened)");
         RestoreConfirmChrome();
+        ForceEnableConfirmYesNo();
         ClearPendingQtyOpen();
+    }
+
+    /// <summary>
+    /// Live Item Confirm Group whose Yes/No (or Confirm UI List) are inactive — the softlock
+    /// the player sees after a mistimed qty open/cancel.
+    /// </summary>
+    private static bool HasBlankConfirmGroup()
+    {
+        foreach (Transform group in FindActiveConfirmGroups())
+        {
+            if (group == null)
+            {
+                continue;
+            }
+
+            Transform? confirm = FindNamedChild(group, "Confirm") ?? group;
+            Transform? uiList = FindNamedChild(confirm, "UI List");
+            Transform? yes = FindNamedChild(confirm, "Yes");
+            Transform? no = FindNamedChild(confirm, "No");
+
+            bool listOff = uiList != null && !uiList.gameObject.activeSelf;
+            bool yesOff = yes != null && !yes.gameObject.activeSelf;
+            bool noOff = no != null && !no.gameObject.activeSelf;
+            if (listOff || (yesOff && noOff))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Re-enable Yes/No/UI List under live confirm groups by name (not HiddenChrome).</summary>
+    private static void ForceEnableConfirmYesNo()
+    {
+        foreach (Transform group in FindActiveConfirmGroups())
+        {
+            if (group == null)
+            {
+                continue;
+            }
+
+            foreach (Transform t in group.GetComponentsInChildren<Transform>(true))
+            {
+                if (t == null)
+                {
+                    continue;
+                }
+
+                string n = t.name;
+                bool confirmUiList = n == "UI List" && t.parent != null && t.parent.name == "Confirm";
+                if (!confirmUiList && n != "Yes" && n != "No" && n != "Confirm msg" && n != "Costs")
+                {
+                    continue;
+                }
+
+                if ((n == "Yes" || n == "No") && !IsUnderShopConfirmTransform(t))
+                {
+                    continue;
+                }
+
+                if (!t.gameObject.activeSelf)
+                {
+                    t.gameObject.SetActive(true);
+                }
+            }
+        }
+    }
+
+    private static Transform? FindNamedChild(Transform root, string name)
+    {
+        if (root == null)
+        {
+            return null;
+        }
+
+        if (root.name == name)
+        {
+            return root;
+        }
+
+        foreach (Transform t in root.GetComponentsInChildren<Transform>(true))
+        {
+            if (t != null && t.name == name)
+            {
+                return t;
+            }
+        }
+
+        return null;
     }
 
     internal static void ClearPendingQtyOpen()
@@ -228,6 +320,9 @@ internal static class ShopConfirmListPatches
     internal static void SuppressConfirmChromePublic(Transform root) => PreHideConfirmChrome(root);
 
     internal static void RestoreConfirmChromePublic() => RestoreConfirmChrome();
+
+    /// <summary>Cancel/fail path: re-enable Yes/No by name under live confirm (HiddenChrome may be stale).</summary>
+    internal static void ForceEnableConfirmYesNoPublic() => ForceEnableConfirmYesNo();
 
     internal static bool IsUnderShopConfirmPublic(Transform? t) => IsUnderShopConfirmTransform(t);
 
@@ -847,7 +942,8 @@ internal static class ShopConfirmListPatches
 
     private static IEnumerator OpenQtyAfterConfirmShows(ShopMenuStock stock, ShopItemStats stats, string reason)
     {
-        for (int i = 0; i < 45; i++)
+        // 90 frames: ResetShopWindow → re-confirm can take longer than a fresh open.
+        for (int i = 0; i < 90; i++)
         {
             yield return null;
             if (QuantityPicker.Instance == null || QuantityPicker.Instance.IsOpen)
@@ -856,34 +952,71 @@ internal static class ShopConfirmListPatches
                 yield break;
             }
 
-            if (stats == null || stock == null)
+            if (stats == null)
             {
                 _pendingQtyOpen = false;
                 yield break;
             }
 
+            // Re-resolve live stock/confirm each frame — ResetShopWindow can replace the
+            // hierarchy captured at UI CONFIRM, leaving stock.transform.root stale.
+            ShopMenuStock? liveStock = FindActiveShopStock() ?? stock;
+            if (liveStock != null && !IsLiveOpenShopStock(liveStock))
+            {
+                liveStock = FindActiveShopStock();
+            }
+
+            Transform? confirmGroup = null;
+            if (liveStock != null)
+            {
+                confirmGroup = FindActiveConfirmGroup(liveStock.transform.root);
+            }
+
+            if (confirmGroup == null)
+            {
+                foreach (Transform g in FindActiveConfirmGroups())
+                {
+                    confirmGroup = g;
+                    break;
+                }
+            }
+
             // Only once confirm chrome is up (after Can Buy). Never open on a bare frame wait.
-            if (FindActiveConfirmGroup(stock.transform.root) == null)
+            if (confirmGroup == null)
+            {
+                continue;
+            }
+
+            liveStock ??= confirmGroup.GetComponentInParent<ShopMenuStock>(true) ?? stock;
+            if (liveStock == null)
             {
                 continue;
             }
 
             // Kill Yes/No this frame before they can take input / flash.
-            PreHideConfirmChrome(stock.transform.root);
+            PreHideConfirmChrome(confirmGroup);
             MerchantStackerPlugin.Log.LogInfo(
                 $"{reason} → open qty: {stats.Item.DisplayName}");
-            OpenQtyReplacingConfirm(stock, stats);
+            OpenQtyReplacingConfirm(liveStock, stats);
             _pendingQtyOpen = false;
             if (QuantityPicker.Instance != null && QuantityPicker.Instance.IsOpen)
             {
                 _armedBulkStats = null;
                 yield break;
             }
+
+            // Open failed after PreHide — put Yes/No back immediately, don't keep looping hidden.
+            RestoreConfirmChrome();
+            ForceEnableConfirmYesNo();
+            MerchantStackerPlugin.Log.LogWarning(
+                $"Confirm qty: OpenInShop failed mid-wait (via '{reason}') — restored vanilla confirm");
+            yield break;
         }
 
         _pendingQtyOpen = false;
         // Never strand hidden Yes/No — put vanilla confirm back so the player can still buy.
         RestoreConfirmChrome();
+        ForceEnableConfirmYesNo();
         MerchantStackerPlugin.Log.LogWarning(
             $"Confirm qty: failed to open (via '{reason}') — restored vanilla confirm");
     }
@@ -1011,6 +1144,7 @@ internal static class ShopConfirmListPatches
         if (confirmGroup != null)
         {
             RestoreConfirmChrome();
+            ForceEnableConfirmYesNo();
         }
     }
 

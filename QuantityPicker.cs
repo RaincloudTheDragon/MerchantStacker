@@ -1541,10 +1541,37 @@ internal sealed class QuantityPicker : MonoBehaviour
         }
 
         // Children keep activeSelf across parent toggle — re-enable before hiding group.
+        // ForceEnable covers rebuilt hierarchies where HiddenChrome refs are already stale.
         Patches.ShopConfirmListPatches.RestoreConfirmChromePublic();
+        Patches.ShopConfirmListPatches.ForceEnableConfirmYesNoPublic();
         foreach (Transform t in root.GetComponentsInChildren<Transform>(true))
         {
-            if (t != null && t.name == "Item Confirm Group" && t.gameObject.activeSelf)
+            if (t == null || t.name != "Item Confirm Group")
+            {
+                continue;
+            }
+
+            // Ensure Yes/No/UI List are activeSelf=true while group is still reachable,
+            // then hide the group so the next open does not inherit inactive children.
+            foreach (Transform child in t.GetComponentsInChildren<Transform>(true))
+            {
+                if (child == null)
+                {
+                    continue;
+                }
+
+                string n = child.name;
+                bool confirmUiList = n == "UI List" && child.parent != null && child.parent.name == "Confirm";
+                if (confirmUiList || n == "Yes" || n == "No" || n == "Confirm msg" || n == "Costs")
+                {
+                    if (!child.gameObject.activeSelf)
+                    {
+                        child.gameObject.SetActive(true);
+                    }
+                }
+            }
+
+            if (t.gameObject.activeSelf)
             {
                 t.gameObject.SetActive(false);
             }

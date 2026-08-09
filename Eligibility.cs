@@ -102,7 +102,9 @@ internal static class Eligibility
     }
 
     /// <summary>
-    /// True when we should replace Yes/No with qty (stackable + can buy at least one).
+    /// True when we should replace Yes/No with qty (stackable + can buy at least two).
+    /// Max of 1 keeps vanilla Yes/No — a qty pad that cannot step is pointless and was a
+    /// softlock source (cancel → re-confirm left Yes/No inactive under the confirm group).
     /// </summary>
     public static bool ShouldOfferBulkQty(ShopItem? item)
     {
@@ -111,7 +113,7 @@ internal static class Eligibility
             return false;
         }
 
-        return GetMaxQuantity(item) >= 1;
+        return GetMaxQuantity(item) >= 2;
     }
 
     public static int GetMaxQuantity(ShopItem item)
