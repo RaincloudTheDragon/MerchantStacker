@@ -17,8 +17,9 @@ QOL mod for Hollow Knight: Silksong — buy stackable merchant refills (rosary s
 
 ## Build
 
+Example:
 ```bash
-dotnet new silksongpath --silksong-install-path "E:/SteamLibrary/steamapps/common/Hollow Knight Silksong"
+dotnet new silksongpath --silksong-install-path "[Path to your Steam Library]/steamapps/common/Hollow Knight Silksong"
 dotnet build -c Release
 ```
 
